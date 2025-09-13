@@ -47,7 +47,7 @@ from dotenv import load_dotenv
 # =========================
 load_dotenv()
 # Execution mode: "tsx" (direct TopstepX) or "projectx"
-EXECUTION_MODE = os.getenv("EXECUTION_MODE", "tsx").strip().lower()
+EXECUTION_MODE = (os.getenv("EXECUTION_MODE", "tsx") or "tsx").strip().lower()
 
 # --- ProjectX vars (only used if EXECUTION_MODE=projectx) ---
 PX_URL       = os.getenv("PX_URL", "").strip()
@@ -61,8 +61,8 @@ TSX_ACCOUNT_INFO_URL  = os.getenv("TSX_ACCOUNT_INFO_URL", "").strip()   # e.g., 
 
 TZ_NAME  = os.getenv("TZ", "America/New_York").strip()
 SYMBOL   = os.getenv("SYMBOL", "MNQ").strip()
-PAPER    = os.getenv("PAPER", "false").lower() == "true"
-TEST_FIRE = os.getenv("TEST_FIRE", "false").lower() == "true"
+PAPER    = os.getenv("PAPER", "false").strip().lower() in {"true", "1", "yes"}
+TEST_FIRE = os.getenv("TEST_FIRE", "false").strip().lower() in {"true", "1", "yes"}
 # SHOW_BALANCE_ON_START = os.getenv("SHOW_BALANCE_ON_START", "true").lower() == "true"
 # BALANCE_POLL_SECS = int(os.getenv("BALANCE_POLL_SECS", "0"))  # 0 = disabled
 
@@ -98,8 +98,8 @@ def load_state() -> Dict:
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[ERROR] Failed to load state file '{STATE_FILE}': {e}")
     return {
         "weekly_anchor": datetime.now(ZoneInfo(TZ_NAME)).isocalendar().week,
         "weekly_net": 0.0,
@@ -108,8 +108,11 @@ def load_state() -> Dict:
     }
 
 def save_state(state: Dict):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"[ERROR] Failed to save state: {e}")
 
 STATE = load_state()
 
@@ -164,7 +167,10 @@ class TSXClient:
     async def stream_bars(self, symbol: str, tf_seconds:int=60):
         """Yield fake bars for demo. Replace with TopstepX quotes/candles WS.
         Yields: {"ts": datetime, "open":, "high":, "low":, "close":, "volume":}
+        Args:
+            symbol (str): Trading symbol (currently unused in stub).
         """
+        _ = symbol  # Mark symbol as intentionally unused in stub
         price = 18000.0
         while True:
             o = price
@@ -220,9 +226,10 @@ class TSXOrderClient:
             "side": order.get("side"),             # BUY/SELL
             "type": order.get("orderType", "market"),
             "qty": order.get("qty", 1),
-            "bracket": order.get("bracket", {}),   # {stopLoss:{price}, takeProfit:{price}}
-            "metadata": order.get("metadata", {})
+            "bracket": order.get("bracket", {})    # {stopLoss:{price}, takeProfit:{price}}
         }
+        if PAPER:
+            print("[PAPER MODE] Simulated TSX POST", self.order_url, json.dumps(body))
         if PAPER:
             print("[PAPER] TSX POST", self.order_url, json.dumps(body))
             return True, "paper"
@@ -302,8 +309,8 @@ class StrategyEngine:
         self.last_cross_state = cur
         return crossed
 
-    def weekly_kill_switch(self) -> bool:
-        return STATE.get("weekly_net", 0.0) <= -abs(self.cfg.inputs.maxWeeklyLoss)
+    def weekly_kill_switch(self, state: Dict) -> bool:
+        return state.get("weekly_net", 0.0) <= -abs(self.cfg.inputs.maxWeeklyLoss)
 
     def position_size(self, atr_value: float, side: str) -> int:
         i = self.cfg.inputs
@@ -323,6 +330,8 @@ class StrategyEngine:
             sl = ref_price + atr_value * 1.5
             tp = ref_price - atr_value * 1.5 * 2.0  # 1:2
         def round_to_tick(px: float) -> float:
+            if MIN_TICK <= 0:
+                raise ValueError("MIN_TICK must be greater than 0 for valid rounding.")
             return round(px / MIN_TICK) * MIN_TICK
         return round_to_tick(sl), round_to_tick(tp)
 
@@ -342,14 +351,13 @@ async def run_bot():
     cfg = StrategyConfig(inputs=inputs)
     engine = StrategyEngine(cfg, tz)
     tsx = TSXClient(tz)
-
     # Execution wiring
-    px = ProjectX(PX_URL, PX_TOKEN) if EXECUTION_MODE == "projectx" else None
     tsx_exec = TSXOrderClient(TSX_API_KEY, TSX_ACCOUNT, TSX_ORDER_URL) if EXECUTION_MODE == "tsx" else None
-    tsx_account = TSXAccountClient(TSX_API_KEY, TSX_ACCOUNT, TSX_ACCOUNT_INFO_URL) if EXECUTION_MODE == "tsx" else None
+    px = ProjectX(PX_URL, PX_TOKEN) if EXECUTION_MODE == "projectx" else None
 
     mode_label = "TopstepX-direct" if EXECUTION_MODE == "tsx" else "ProjectX"
     print(f"Duvenchy bot running… mode={mode_label} | symbol={cfg.symbol}")
+    print(f"EXECUTION_MODE={EXECUTION_MODE} PAPER={PAPER} TSX_ORDER_URL={'set' if (EXECUTION_MODE=='tsx' and TSX_ORDER_URL) else 'missing'} TSX_ACCOUNT={TSX_ACCOUNT if EXECUTION_MODE=='tsx' else '-'}")
     print(f"EXECUTION_MODE={EXECUTION_MODE} PAPER={PAPER} TSX_ORDER_URL={'set' if (EXECUTION_MODE=='tsx' and TSX_ORDER_URL) else 'missing'} TSX_ACCOUNT={TSX_ACCOUNT if EXECUTION_MODE=='tsx' else '-'}")
 
     # # Show account balance at start
@@ -379,22 +387,25 @@ async def run_bot():
     #     asyncio.create_task(poll_balance())
 
     # Fire one immediate test order (no need to wait for signals)
-    if TEST_FIRE and EXECUTION_MODE == 'tsx' and tsx_exec:
-        test_price = 18000.0
-        sl = round(test_price - 20.0, 2)
-        tp = round(test_price + 30.0, 2)
-        payload = {
-            "symbol": cfg.symbol,
-            "side": "BUY",
-            "orderType": "market",
-            "qty": 1,
-            "bracket": {"stopLoss": {"price": sl}, "takeProfit": {"price": tp}},
-            "metadata": {"clientId": "duvenchy-bot", "strategy": "test-fire",
-                         "sentAt": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")}
-        }
-        ok, info = tsx_exec.place_order({**payload, "accountId": TSX_ACCOUNT})
-        print(f"[TEST_FIRE] ok={ok} info={info}")
-
+    # if TEST_FIRE and EXECUTION_MODE == 'tsx' and tsx_exec:
+    #     test_price = 18000.0
+    #     sl = round(test_price - 20.0, 2)
+    #     tp = round(test_price + 30.0, 2)
+    #     payload = {
+    #         "symbol": cfg.symbol,
+    #         "side": "BUY",
+    #         "orderType": "market",
+    #         "qty": 1,
+    #         "bracket": {"stopLoss": {"price": sl}, "takeProfit": {"price": tp}},
+    #         "metadata": {
+    #             "clientId": "duvenchy-bot",
+    #             "strategy": "test-fire",
+    #             "sentAt": datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
+    #         },
+    #         "accountId": TSX_ACCOUNT
+    #     }
+    #     ok, info = tsx_exec.place_order(payload)
+    #     print(f"[TEST_FIRE] ok={ok} info={info}")
     # Main bar loop (replace with real TopstepX data stream)
     async for bar in tsx.stream_bars(SYMBOL, tf_seconds=60):
         ts = bar["ts"]
@@ -408,15 +419,20 @@ async def run_bot():
 
         ind = engine.update_indicators(bar)
         f, s, a, v = ind["ema_fast"], ind["ema_slow"], ind["atr"], ind["vwap"]
-        if f is None or s is None or a is None:
-            print("[WARMUP] building indicators…")
+        warmup_status = {
+            "ema_fast": f is not None,
+            "ema_slow": s is not None,
+            "atr": a is not None,
+        }
+        if not all(warmup_status.values()):
+            print(f"[WARMUP] building indicators… {warmup_status}")
             continue
 
         if not engine.in_hour_window(ts):
             print("[IDLE] hour disabled")
             continue
 
-        if engine.weekly_kill_switch():
+        if engine.weekly_kill_switch(STATE):
             print(f"[LOCK] weekly loss cap reached (weekly_net={STATE.get('weekly_net')}) – ignoring")
             continue
 
@@ -434,9 +450,11 @@ async def run_bot():
         qty = engine.position_size(a, side)
         if qty <= 0:
             print("[SKIP] qty=0 due to risk sizing / ATR")
-            continue
+            continue  # <-- Add this to skip order if qty is 0
 
+        # Define sl and tp using build_bracket
         sl, tp = engine.build_bracket(price, a, side)
+
         payload = {
             "symbol": cfg.symbol,
             "side": "BUY" if side == "LONG" else "SELL",
@@ -451,16 +469,19 @@ async def run_bot():
                 "strategy": "Nasdaq100Micro-OptimizedRisk",
                 "emaShort": inputs.emaShort,
                 "emaLong": inputs.emaLong,
-                "atrLen": inputs.atrLength,
-                "sentAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            }
+                "atrLen": inputs.atrLength
+            },
+            "accountId": TSX_ACCOUNT
         }
 
         # Route the order
         if EXECUTION_MODE == "projectx" and px:
             ok, info = px.send(payload)
         else:  # tsx direct
-            ok, info = tsx_exec.place_order({**payload, "accountId": TSX_ACCOUNT})
+            if not TSX_ACCOUNT:
+                print("[ERROR] TSX_ACCOUNT is not configured. Skipping order placement.")
+                continue
+            ok, info = tsx_exec.place_order(payload)
 
         if ok:
             STATE["last_trade_time"] = time.time()
@@ -469,15 +490,16 @@ async def run_bot():
             print(f"[ORDER] {side} {qty} {cfg.symbol} @~{price:.2f} SL={sl:.2f} TP={tp:.2f} :: {info}")
         else:
             print(f"[FAIL] send: {info}")
+            print(f"[ORDER] {side} {qty} {cfg.symbol} @~{price:.2f} SL={sl:.2f} TP={tp:.2f} :: {info}")
 
-# =========================
-# Entrypoint
-# =========================
 if __name__ == "__main__":
+    import sys
     try:
-        import sys
         sys.stdout.reconfigure(line_buffering=True)
         print("Starting Duvenchy bot…")
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        print("Graceful exit")
         asyncio.run(run_bot())
     except KeyboardInterrupt:
         print("Graceful exit")
