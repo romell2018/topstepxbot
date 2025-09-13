@@ -1,12 +1,12 @@
 """
 Duvenchy – TopstepX-only data ▶ (optional) ProjectX orders
-Port of your Pine v6 strategy:
+
   - EMA(9/21) crossover with optional VWAP filter
   - 24 hourly enable toggles w/ timezone
   - ATR-based sizing + SL/TP (Long 1:3, Short 1:2)
   - Weekly loss kill switch
   - Test-fire & paper modes
-  - Account balance fetch (startup + optional polling)
+  -  Account balance fetch (startup + optional polling)(soon)
 
 Run:
 
