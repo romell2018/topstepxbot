@@ -32,13 +32,6 @@ python -u duvenchy_topstepx_projectx_bot.py
   SHOW_BALANCE_ON_START=true
   BALANCE_POLL_SECS=0
 
-.env example (ProjectX webhook, optional):
-  EXECUTION_MODE=projectx
-  PX_URL=https://projectx.example.com/webhook/abc123
-  PX_TOKEN=px_secret_optional
-  TZ=America/New_York
-  SYMBOL=MNQ
-  PAPER=true
 """
 from __future__ import annotations
 import os, json, time, math, uuid, asyncio, dataclasses
@@ -70,8 +63,8 @@ TZ_NAME  = os.getenv("TZ", "America/New_York").strip()
 SYMBOL   = os.getenv("SYMBOL", "MNQ").strip()
 PAPER    = os.getenv("PAPER", "false").lower() == "true"
 TEST_FIRE = os.getenv("TEST_FIRE", "false").lower() == "true"
-SHOW_BALANCE_ON_START = os.getenv("SHOW_BALANCE_ON_START", "true").lower() == "true"
-BALANCE_POLL_SECS = int(os.getenv("BALANCE_POLL_SECS", "0"))  # 0 = disabled
+# SHOW_BALANCE_ON_START = os.getenv("SHOW_BALANCE_ON_START", "true").lower() == "true"
+# BALANCE_POLL_SECS = int(os.getenv("BALANCE_POLL_SECS", "0"))  # 0 = disabled
 
 # =========================
 # Config – mirrors Pine inputs
@@ -359,31 +352,31 @@ async def run_bot():
     print(f"Duvenchy bot running… mode={mode_label} | symbol={cfg.symbol}")
     print(f"EXECUTION_MODE={EXECUTION_MODE} PAPER={PAPER} TSX_ORDER_URL={'set' if (EXECUTION_MODE=='tsx' and TSX_ORDER_URL) else 'missing'} TSX_ACCOUNT={TSX_ACCOUNT if EXECUTION_MODE=='tsx' else '-'}")
 
-    # Show account balance at start
-    if EXECUTION_MODE == 'tsx' and SHOW_BALANCE_ON_START:
-        ok, data = tsx_account.get_info()
-        if ok:
-            bal  = data.get('balance') or data.get('cash') or data.get('equity') or 'unknown'
-            upnl = data.get('unrealizedPnL') or data.get('upnl') or 0
-            rpnl = data.get('realizedPnL') or data.get('rpnl') or 0
-            print(f"[ACCOUNT] balance={bal} realizedPnL={rpnl} unrealizedPnL={upnl}")
-        else:
-            print(f"[ACCOUNT] failed: {data}")
+    # # Show account balance at start
+    # if EXECUTION_MODE == 'tsx' and SHOW_BALANCE_ON_START:
+    #     ok, data = tsx_account.get_info()
+    #     if ok:
+    #         bal  = data.get('balance') or data.get('cash') or data.get('equity') or 'unknown'
+    #         upnl = data.get('unrealizedPnL') or data.get('upnl') or 0
+    #         rpnl = data.get('realizedPnL') or data.get('rpnl') or 0
+    #         print(f"[ACCOUNT] balance={bal} realizedPnL={rpnl} unrealizedPnL={upnl}")
+    #     else:
+    #         print(f"[ACCOUNT] failed: {data}")
 
     # Optional periodic balance polling
-    if EXECUTION_MODE == 'tsx' and BALANCE_POLL_SECS > 0:
-        async def poll_balance():
-            while True:
-                await asyncio.sleep(BALANCE_POLL_SECS)
-                ok, data = tsx_account.get_info()
-                if ok:
-                    bal  = data.get('balance') or data.get('cash') or data.get('equity') or 'unknown'
-                    upnl = data.get('unrealizedPnL') or data.get('upnl') or 0
-                    rpnl = data.get('realizedPnL') or data.get('rpnl') or 0
-                    print(f"[ACCOUNT] balance={bal} realizedPnL={rpnl} unrealizedPnL={upnl}")
-                else:
-                    print(f"[ACCOUNT] failed: {data}")
-        asyncio.create_task(poll_balance())
+    # if EXECUTION_MODE == 'tsx' and BALANCE_POLL_SECS > 0:
+    #     async def poll_balance():
+    #         while True:
+    #             await asyncio.sleep(BALANCE_POLL_SECS)
+    #             ok, data = tsx_account.get_info()
+    #             if ok:
+    #                 bal  = data.get('balance') or data.get('cash') or data.get('equity') or 'unknown'
+    #                 upnl = data.get('unrealizedPnL') or data.get('upnl') or 0
+    #                 rpnl = data.get('realizedPnL') or data.get('rpnl') or 0
+    #                 print(f"[ACCOUNT] balance={bal} realizedPnL={rpnl} unrealizedPnL={upnl}")
+    #             else:
+    #                 print(f"[ACCOUNT] failed: {data}")
+    #     asyncio.create_task(poll_balance())
 
     # Fire one immediate test order (no need to wait for signals)
     if TEST_FIRE and EXECUTION_MODE == 'tsx' and tsx_exec:
