@@ -1,4 +1,4 @@
-#!/home/romell/topstepxbot/.venv/bin/python3
+#!/home/romell/topstepxbot/.venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys

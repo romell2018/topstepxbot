@@ -1,0 +1,12 @@
+{
+  "weekly_anchor": 37,
+  "weekly_net": 0.0,
+  "last_trade_time": 1757827414.8207257,
+  "open_position": {
+    "side": "LONG",
+    "qty": 9,
+    "avg": 18001.49,
+    "sl": 17991.0,
+    "tp": 18033.0
+  }
+}

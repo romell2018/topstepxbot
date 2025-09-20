@@ -1,0 +1,6 @@
+requests>=2.31
+PyYAML>=6.0
+pandas>=2.0
+numpy>=1.24
+quart>=0.19
+signalrcore>=0.9.4
