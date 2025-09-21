@@ -24,7 +24,14 @@ def api_post(api_url: str, token: str, endpoint: str, payload: dict):
         res = requests.post(
             f"{api_url}{endpoint}",
             json=payload,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0",
+                "x-app-type": "px-desktop",
+                "x-app-version": "1.21.1",
+            },
             verify=False,
         )
         res.raise_for_status()
@@ -71,4 +78,3 @@ def get_account_info(token: str):
     except Exception as e:
         logging.error(f"Account info fetch error: {e}")
         return None
-

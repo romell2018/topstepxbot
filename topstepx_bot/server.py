@@ -165,8 +165,19 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
     async def get_bars():
         symbol = (request.args.get("symbol") or SYMBOL).upper()
         limit = int(request.args.get("limit", 200))
+        include_current = str(request.args.get("includeCurrent", "0")).lower() in ("1", "true", "yes")
         with _bars_lock:
             out = list(bars_by_symbol.get(symbol, []))[-limit:]
+        if include_current:
+            try:
+                ms = (ctx.get('streamers') or {}).get(symbol)
+                if ms and getattr(ms, 'cur_bar', None):
+                    cur = dict(ms.cur_bar)
+                    # avoid duplicate minute if it matches last finalized bar
+                    if not out or out[-1].get('t') != cur.get('t'):
+                        out = (out + [cur])[-limit:]
+            except Exception:
+                pass
         return jsonify({"symbol": symbol, "bars": out})
 
     @app.get("/price")
@@ -178,7 +189,14 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
     @app.get("/indicators")
     async def get_indicators():
         symbol = (request.args.get("symbol") or SYMBOL).upper()
+        real_only = str(request.args.get("realOnly", "0")).lower() in ("1", "true", "yes")
         state = indicator_state.get(symbol) or {}
+        if real_only:
+            out = dict(state)
+            ef_r = out.get("emaFastReal"); es_r = out.get("emaSlowReal")
+            out["emaFast"] = ef_r if ef_r is not None else None
+            out["emaSlow"] = es_r if es_r is not None else None
+            return jsonify({"symbol": symbol, **out})
         return jsonify({"symbol": symbol, **state})
 
     def get_open_orders_count(contract_id: Any = None) -> int:
@@ -221,6 +239,21 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
             logging.warning(f"No contract info for {SYMBOL}; verify symbol or load_contracts() output")
             return
         contract_id = contract["contractId"]
+        try:
+            logging.info(
+                "Warmup params | symbol=%s contractId=%s live=%s hours=%s",
+                SYMBOL,
+                str(contract_id),
+                str(LIVE_FLAG),
+                str(ctx.get('BOOTSTRAP_HISTORY_HOURS')),
+            )
+            synth_min = int(ctx.get('SYNTH_WARMUP_MINUTES') or 0)
+            if synth_min <= 0:
+                logging.info("Warmup mode: synthetic disabled; waiting for real minute bars to accumulate")
+            else:
+                logging.info("Warmup mode: synthetic enabled (%d minutes)", synth_min)
+        except Exception:
+            pass
         ctx['warmup_bars'](SYMBOL, contract_id, days=1, unit=2, unit_n=1, live=LIVE_FLAG)
 
         def run_stream():
@@ -231,10 +264,19 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
             ms = ctx['MarketStreamer'](SYMBOL, contract_id, unit=2, unit_n=1)
             ctx['seed_streamer_from_warmup'](ms)
             try:
-                snap = ms._pd_indicator_snapshot() or {}
-                ef = snap.get("emaFast"); es = snap.get("emaSlow"); vw = snap.get("vwap"); prev_rel = snap.get("prev_rel")
-                if prev_rel is not None:
-                    ms._last_rel = float(prev_rel)
+                # Prefer indicator_state values (which are real-first); fall back to snapshot when absent
+                st = indicator_state.get(SYMBOL) or {}
+                ef = st.get("emaFast") or st.get("emaFastReal") or st.get("emaFastSeeded")
+                es = st.get("emaSlow") or st.get("emaSlowReal") or st.get("emaSlowSeeded")
+                vw = st.get("vwap")
+                if (ef is None) or (es is None):
+                    snap = ms._pd_indicator_snapshot() or {}
+                    ef = ef or snap.get("emaFast")
+                    es = es or snap.get("emaSlow")
+                    vw = vw or snap.get("vwap")
+                    prev_rel = snap.get("prev_rel")
+                    if prev_rel is not None:
+                        ms._last_rel = float(prev_rel)
                 op = last_price.get(SYMBOL)
                 if op is None:
                     with _bars_lock:
@@ -246,7 +288,7 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
                             op = None
                 atr_val = ms.atr.value
                 if DEBUG:
-                    logging.info("Warmup check | price=%s ef=%s es=%s vwap=%s prev_rel=%s atr=%s", str(op), str(ef), str(es), str(vw), str(prev_rel), str(atr_val))
+                    logging.info("Warmup check | price=%s ef=%s es=%s vwap=%s atr=%s", str(op), str(ef), str(es), str(vw), str(atr_val))
                 if (op is not None) and (ef is not None) and (es is not None) and (atr_val is not None):
                     ms._maybe_trade(float(op), float(ef), float(es), vw, float(atr_val))
             except Exception:
@@ -259,4 +301,3 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
         threading.Thread(target=run_stream, daemon=True).start()
 
     return app
-

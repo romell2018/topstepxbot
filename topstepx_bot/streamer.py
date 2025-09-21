@@ -25,6 +25,7 @@ class MarketStreamer:
         self._last_signal_ts: float = 0.0
         self._pending_signal: Optional[dict] = None
         self._last_intrabar_minute: Optional[dt.datetime] = None
+        self._real_bars: int = 0
 
     def _pd_indicator_snapshot(self) -> Optional[Dict[str, Optional[float]]]:
         try:
@@ -60,6 +61,11 @@ class MarketStreamer:
     def _finalize_bar(self):
         if not self.cur_bar:
             return
+        try:
+            # Mark finalized bar as real (non-synthetic)
+            self.cur_bar["syn"] = False
+        except Exception:
+            pass
         with self.ctx['bars_lock']:
             lst = self.ctx['bars_by_symbol'].setdefault(self.symbol, [])
             lst.append(self.cur_bar)
@@ -86,11 +92,58 @@ class MarketStreamer:
                     pass
             self._last_rel = prev_rel
             if (ef is not None) and (es is not None):
-                self.ctx['indicator_state'][self.symbol] = {"emaFast": ef, "emaSlow": es, "vwap": vw, "atr": av}
-                logging.info(
-                    f"{self.symbol} close={c:.2f} | EMA{self.ctx['EMA_SHORT']}={ef:.2f} EMA{self.ctx['EMA_LONG']}={es:.2f} VWAP={(vw if vw is not None else float('nan')):.2f}"
-                )
+                # Compute real-only EMAs (exclude synthetic bars) using pandas EWM from first bar
+                ef_r = es_r = None
+                try:
+                    with self.ctx['bars_lock']:
+                        bars = list(self.ctx['bars_by_symbol'].get(self.symbol, []))
+                    if bars:
+                        df = pd.DataFrame(bars)
+                        if 'syn' in df.columns:
+                            df_real = df[df.get('syn') != True].copy()
+                        else:
+                            df_real = df.copy()
+                        if df_real.shape[0] >= 1:
+                            df_real = df_real.rename(columns={'c': 'close', 'v': 'volume', 't': 'time', 'o': 'open', 'h': 'high', 'l': 'low'})
+                            ser = pd.to_numeric(df_real['close'], errors='coerce').astype(float)
+                            ef_r = ser.ewm(span=int(self.ctx['EMA_SHORT']), adjust=False).mean().iloc[-1]
+                            es_r = ser.ewm(span=int(self.ctx['EMA_LONG']), adjust=False).mean().iloc[-1]
+                            if pd.isna(ef_r):
+                                ef_r = None
+                            else:
+                                ef_r = float(ef_r)
+                            if pd.isna(es_r):
+                                es_r = None
+                            else:
+                                es_r = float(es_r)
+                except Exception:
+                    pass
+                # Prefer real EMAs in primary fields when available; also expose both variants
+                st = {
+                    "emaFast": (ef_r if ef_r is not None else ef),
+                    "emaSlow": (es_r if es_r is not None else es),
+                    "emaFastReal": ef_r,
+                    "emaSlowReal": es_r,
+                    "emaFastSeeded": ef,
+                    "emaSlowSeeded": es,
+                    "vwap": vw,
+                    "atr": av,
+                }
+                self.ctx['indicator_state'][self.symbol] = st
+                try:
+                    log_ef = st.get("emaFast"); log_es = st.get("emaSlow")
+                    logging.info(
+                        f"{self.symbol} close={c:.2f} | EMA{self.ctx['EMA_SHORT']}={float(log_ef):.2f} EMA{self.ctx['EMA_LONG']}={float(log_es):.2f} VWAP={(vw if vw is not None else float('nan')):.2f}"
+                    )
+                except Exception:
+                    logging.info(
+                        f"{self.symbol} close={c:.2f} | EMA{self.ctx['EMA_SHORT']}={st.get('emaFast')} EMA{self.ctx['EMA_LONG']}={st.get('emaSlow')} VWAP={(vw if vw is not None else float('nan')):.2f}"
+                    )
                 self._maybe_trade(c, float(ef), float(es), vw, av)
+        except Exception:
+            pass
+        try:
+            self._real_bars += 1
         except Exception:
             pass
         self.cur_bar = None
@@ -99,6 +152,14 @@ class MarketStreamer:
         now = time.time()
         if atr_val is None or ef is None or es is None:
             return
+        try:
+            min_rb = int(self.ctx.get('MIN_REAL_BARS_BEFORE_TRADING', 0) or 0)
+            if self._real_bars < min_rb:
+                if self.ctx['DEBUG']:
+                    logging.info("Gating trade: waiting for real bars (%d/%d)", int(self._real_bars), int(min_rb))
+                return
+        except Exception:
+            pass
         rel = ef - es
         prev_rel = self._last_rel
         cross_up = (prev_rel is not None) and (prev_rel <= 0) and (rel > 0)
@@ -407,8 +468,8 @@ class MarketStreamer:
             bal = self.ctx['account_snapshot'].get("balance")
             eq = self.ctx['account_snapshot'].get("equity")
             st = self.ctx['indicator_state'].get(self.symbol) or {}
-            ef = st.get("emaFast")
-            es = st.get("emaSlow")
+            ef = st.get("emaFastReal") or st.get("emaFast")
+            es = st.get("emaSlowReal") or st.get("emaSlow")
             if ef is not None and es is not None:
                 logging.info(
                     f"{self.symbol} price: {price:.2f} | EMA{self.ctx['EMA_SHORT']}={self.ctx['fmt_num'](ef)} EMA{self.ctx['EMA_LONG']}={self.ctx['fmt_num'](es)} | bal={self.ctx['fmt_num'](bal)} eq={self.ctx['fmt_num'](eq)}"
@@ -461,6 +522,12 @@ class MarketStreamer:
                     now = time.time()
                     if (now - self._last_signal_ts) < self.ctx['TRADE_COOLDOWN_SEC']:
                         return
+                    try:
+                        min_rb = int(self.ctx.get('MIN_REAL_BARS_BEFORE_TRADING', 0) or 0)
+                        if self._real_bars < min_rb:
+                            return
+                    except Exception:
+                        pass
                     oc = self.ctx['get_open_orders_count'](self.contract_id)
                     if oc > 0:
                         return
@@ -488,6 +555,35 @@ class MarketStreamer:
             if not price or not ts:
                 return
             t = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+            # Synthetic warmup: if no history and allowed, backfill flat bars to seed EMAs
+            try:
+                if self.ctx.get('ALLOW_SYNTH_WARMUP'):
+                    with self.ctx['bars_lock']:
+                        existing = list(self.ctx['bars_by_symbol'].get(self.symbol, []))
+                    if not existing:
+                        minutes = int(self.ctx.get('SYNTH_WARMUP_MINUTES') or 0)
+                        if minutes > 0:
+                            base_minute = t.replace(second=0, microsecond=0, tzinfo=dt.timezone.utc)
+                            synth = []
+                            for i in range(minutes, 0, -1):
+                                m = base_minute - dt.timedelta(minutes=i)
+                                synth.append({
+                                    "t": m.isoformat().replace("+00:00", "Z"),
+                                    "o": price, "h": price, "l": price, "c": price, "v": 0.0, "syn": True
+                                })
+                            with self.ctx['bars_lock']:
+                                self.ctx['bars_by_symbol'][self.symbol] = synth[-300:]
+                            # Compute and store indicators from synthetic bars (ATR left as is)
+                            try:
+                                snap = self._pd_indicator_snapshot() or {}
+                                ef = snap.get("emaFast"); es = snap.get("emaSlow"); vw = snap.get("vwap")
+                                if (ef is not None) and (es is not None):
+                                    self.ctx['indicator_state'][self.symbol] = {"emaFast": ef, "emaSlow": es, "vwap": vw, "atr": self.atr.value}
+                                    logging.info("Synthetic warmup seeded %d flat bars for %s to initialize EMAs", len(synth[-300:]), self.symbol)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
             self._ingest(t, price, 0.0)
         except Exception:
             pass

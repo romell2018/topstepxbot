@@ -44,7 +44,9 @@ API_KEY = config.get("api_key") or AUTH.get("api_key") or ""
 ACCOUNT_ID = int(config.get("account_id") or (config.get("account") or {}).get("id") or 0)
 SYMBOL = (config.get("symbol") or "MNQ").upper()
 MARKET_HUB = config.get("market_hub") or "https://rtc.topstepx.com/hubs/market"
-LIVE_FLAG = True
+LIVE_FLAG = bool((config.get("market") or {}).get("live", True))
+INCLUDE_PARTIAL = bool((config.get("market") or {}).get("includePartialBar", True))
+BOOTSTRAP_HISTORY_HOURS = int(config.get("bootstrap_history_hours", 3) or 3)
 
 
 app = Quart(__name__)
@@ -94,6 +96,17 @@ USE_FIXED_TARGETS = bool(TRADE_CFG.get("useFixedTargets", False))
 
 ATR = _ATR
 
+# Synthetic warmup sizing (after EMA_LONG is defined)
+SYNTH_WARMUP_MINUTES = int(config.get("synthetic_warmup_minutes", 0) or 0)
+if SYNTH_WARMUP_MINUTES <= 0:
+    try:
+        SYNTH_WARMUP_MINUTES = max(int(EMA_LONG), int(BOOTSTRAP_HISTORY_HOURS) * 60)
+    except Exception:
+        SYNTH_WARMUP_MINUTES = int(EMA_LONG)
+
+# Optional guard: require N real finalized bars before trading
+MIN_REAL_BARS_BEFORE_TRADING = int(STRAT.get("minRealBarsBeforeTrading", 2) or 0)
+
 
 # API wrappers
 def get_token():
@@ -127,6 +140,7 @@ def warmup_bars(symbol: str, contract_id: Any, days: int = 1, unit: int = 2, uni
         logging.warning("Warmup failed: no token")
         return
     tzname = config.get("tz") or "America/New_York"
+    hours = BOOTSTRAP_HISTORY_HOURS if BOOTSTRAP_HISTORY_HOURS and BOOTSTRAP_HISTORY_HOURS > 0 else None
     return market_warmup_bars(
         lambda endpoint, payload: api_post(token, endpoint, payload),
         token,
@@ -145,6 +159,8 @@ def warmup_bars(symbol: str, contract_id: Any, days: int = 1, unit: int = 2, uni
         EMA_SOURCE,
         RTH_ONLY,
         tzname,
+        hours,
+        INCLUDE_PARTIAL,
     )
 
 
@@ -180,6 +196,7 @@ def run_server():
         'SYMBOL': SYMBOL,
         'ACCOUNT_ID': ACCOUNT_ID,
         'LIVE_FLAG': LIVE_FLAG,
+        'BOOTSTRAP_HISTORY_HOURS': BOOTSTRAP_HISTORY_HOURS,
         'DEBUG': DEBUG,
         'snap_to_tick': snap_to_tick,
         'fmt_num': fmt_num,
@@ -210,6 +227,10 @@ def run_server():
         'compute_indicators': compute_indicators,
         # bracket entry support
         'USE_BRACKETS_PAYLOAD': bool((config.get('trade') or {}).get('useBracketsPayload', True)),
+        # warmup behavior
+        'ALLOW_SYNTH_WARMUP': True,
+        'SYNTH_WARMUP_MINUTES': int(min(300, max(0, SYNTH_WARMUP_MINUTES))),
+        'MIN_REAL_BARS_BEFORE_TRADING': int(max(0, MIN_REAL_BARS_BEFORE_TRADING)),
     }
     ctx['monitor_oco_orders'] = make_monitor_oco_orders(ctx)
     ctx['monitor_account_snapshot'] = make_monitor_account_snapshot(ctx)

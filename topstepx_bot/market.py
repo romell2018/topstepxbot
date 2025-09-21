@@ -3,9 +3,27 @@ import datetime as dt
 from typing import Any, Dict, List, Optional, Callable
 import threading
 import pandas as pd
+import sys
+from pathlib import Path
 
-from .utils import iso_utc_z
-from .indicators import ATR, compute_indicators
+# Import shims to allow running this module directly (python topstepx_bot/market.py)
+try:
+    from .utils import iso_utc_z  # type: ignore
+    from .indicators import ATR, compute_indicators  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        # Ensure project root (parent of package folder) is on sys.path
+        pkg_dir = Path(__file__).resolve().parent
+        proj_root = str(pkg_dir.parent)
+        if proj_root not in sys.path:
+            sys.path.insert(0, proj_root)
+        from topstepx_bot.utils import iso_utc_z  # type: ignore
+        from topstepx_bot.indicators import ATR, compute_indicators  # type: ignore
+    except Exception:
+        # Fallback minimal helper to avoid crashing when printed as script
+        def iso_utc_z(ts: dt.datetime) -> str:
+            ts_utc = ts.astimezone(dt.timezone.utc).replace(microsecond=0, tzinfo=None)
+            return ts_utc.isoformat() + "Z"
 
 
 def seed_contract_from_config(config: dict, symbol: str, contract_map: Dict[str, dict]) -> bool:
@@ -120,9 +138,14 @@ def warmup_bars(api_post: Callable[[str, str, dict], dict], token: str,
                 symbol: str, contract_id: Any, days: int, unit: int, unit_n: int, live: bool,
                 bars_by_symbol: Dict[str, List[Dict[str, Any]]], bars_lock: threading.Lock,
                 indicator_state: Dict[str, Dict[str, Optional[float]]], atr_length: int,
-                ema_short: int, ema_long: int, ema_source: str, rth_only: bool, tzname: str) -> None:
+                ema_short: int, ema_long: int, ema_source: str, rth_only: bool, tzname: str,
+                hours: Optional[int] = None,
+                include_partial: bool = True) -> None:
     end = dt.datetime.now(dt.timezone.utc)
-    start = end - dt.timedelta(days=max(1, days))
+    if hours is not None:
+        start = end - dt.timedelta(hours=max(1, int(hours)))
+    else:
+        start = end - dt.timedelta(days=max(1, days))
     payload = {
         "contractId": contract_id,
         "live": bool(live),
@@ -131,18 +154,61 @@ def warmup_bars(api_post: Callable[[str, str, dict], dict], token: str,
         "unit": unit,
         "unitNumber": unit_n,
         "limit": 20000,
-        "includePartialBar": False,
+        "includePartialBar": bool(include_partial),
     }
+    logging.info(
+        "Warmup request | contractId=%s live=%s unit=%d unit_n=%d start=%s end=%s",
+        str(contract_id), str(bool(live)), int(unit), int(unit_n), iso_utc_z(start), iso_utc_z(end)
+    )
     j = api_post("/api/History/retrieveBars", payload)
     items = j.get("bars", j.get("candles", []))
-    # Fallback: some tenants return no history for live=True — retry once with live=False to seed EMAs
+    try:
+        logging.info(
+            "Warmup response (primary) | success=%s errorCode=%s errorMessage=%s count=%d",
+            str(j.get("success")), str(j.get("errorCode")), str(j.get("errorMessage")), len(items or [])
+        )
+    except Exception:
+        pass
+    # Fallback 1: retry with live=False if live=True returned empty
     if (not items) and live:
         try:
             payload_fallback = dict(payload)
             payload_fallback["live"] = False
             j = api_post("/api/History/retrieveBars", payload_fallback)
             items = j.get("bars", j.get("candles", []))
+            try:
+                logging.info(
+                    "Warmup response (fallback live=False) | success=%s errorCode=%s errorMessage=%s count=%d",
+                    str(j.get("success")), str(j.get("errorCode")), str(j.get("errorMessage")), len(items or [])
+                )
+            except Exception:
+                pass
             logging.info("Warmup fallback: used non-live history to seed indicators")
+        except Exception:
+            pass
+    # Fallback 2: if still empty, expand to 24h window with live=False
+    if not items:
+        try:
+            start24 = end - dt.timedelta(hours=24)
+            payload24 = dict(payload)
+            payload24.update({
+                "startTime": iso_utc_z(start24),
+                "endTime": iso_utc_z(end),
+                "live": False,
+            })
+            j = api_post("/api/History/retrieveBars", payload24)
+            items = j.get("bars", j.get("candles", []))
+            try:
+                logging.info(
+                    "Warmup response (24h live=False) | success=%s errorCode=%s errorMessage=%s count=%d",
+                    str(j.get("success")), str(j.get("errorCode")), str(j.get("errorMessage")), len(items or [])
+                )
+            except Exception:
+                pass
+            if items:
+                logging.info("Warmup second fallback succeeded: 24h, live=False (%d bars)", len(items))
+            else:
+                logging.info("Warmup second fallback also returned 0 bars (24h, live=False)")
         except Exception:
             pass
     loaded = 0
@@ -217,3 +283,11 @@ def seed_streamer_from_warmup(ms, bars_by_symbol, bars_lock, indicator_state) ->
         )
     except Exception as e:
         logging.warning(f"Warmup seeding skipped due to error: {e}")
+
+
+if __name__ == "__main__":
+    # Lightweight help when run as a script
+    print("topstepx_bot.market is a library module.")
+    print("Run the server: python duvenchy_topstepx_projectx_bot.py")
+    now = dt.datetime.now(dt.timezone.utc)
+    print("Example iso_utc_z(now):", iso_utc_z(now))
