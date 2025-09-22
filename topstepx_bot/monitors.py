@@ -76,6 +76,53 @@ def make_monitor_account_snapshot(ctx):
                     await asyncio.sleep(2.0)
                     continue
                 acct = ctx['get_account_info'](token) or {}
+                # Detect closed/suspended account states and gate trading proactively
+                try:
+                    def _val_s(obj, key):
+                        v = obj.get(key)
+                        return str(v).strip().lower() if v is not None else None
+
+                    closed = False
+                    reason = None
+                    # Boolean flags commonly seen
+                    for kb in ('isClosed', 'closed', 'tradingDisabled', 'disabled'):
+                        vb = acct.get(kb)
+                        if isinstance(vb, bool) and vb:
+                            closed = True
+                            reason = f"{kb}=true"
+                            break
+                    # String status fields
+                    if not closed:
+                        for ks in ('status', 'state', 'accountStatus', 'tradingStatus', 'lifecycleState'):
+                            vs = _val_s(acct, ks)
+                            if not vs:
+                                continue
+                            if any(term in vs for term in ('closed', 'suspend', 'disable', 'locked', 'terminated')):
+                                closed = True
+                                reason = f"{ks}={vs}"
+                                break
+                    if closed and not ctx.get('TRADING_DISABLED'):
+                        ctx['TRADING_DISABLED'] = True
+                        ctx['TRADING_DISABLED_REASON'] = reason or 'account closed'
+                        logging.error("Trading disabled: %s", ctx['TRADING_DISABLED_REASON'])
+                    # Auto re-enable if account reopens and setting allows
+                    if (not closed) and ctx.get('TRADING_DISABLED') and ctx.get('AUTO_REENABLE_TRADING_ON_OPEN'):
+                        prev_reason = str(ctx.get('TRADING_DISABLED_REASON') or '').lower()
+                        # Only auto-enable if it was disabled due to account state, not manual kill
+                        if any(term in prev_reason for term in ('closed', 'suspend', 'disable', 'locked', 'terminated')):
+                            ctx['TRADING_DISABLED'] = False
+                            ctx['TRADING_DISABLED_REASON'] = None
+                            logging.info("Trading re-enabled: account state reported open/active")
+                    # Optionally annotate last seen account state
+                    try:
+                        ctx['ACCOUNT_STATE'] = {
+                            'closed': bool(closed),
+                            'reason': reason,
+                        }
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
                 bal = None
                 for k in ("balance", "cash", "cashBalance", "balanceValue"):
                     v = acct.get(k)
@@ -166,4 +213,3 @@ def make_monitor_break_even(ctx):
                 pass
             await asyncio.sleep(0.3)
     return monitor_break_even
-

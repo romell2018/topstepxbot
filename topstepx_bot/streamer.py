@@ -26,6 +26,30 @@ class MarketStreamer:
         self._pending_signal: Optional[dict] = None
         self._last_intrabar_minute: Optional[dt.datetime] = None
         self._real_bars: int = 0
+        self._last_price_log_ts: float = 0.0
+        self._tag_counter: int = 0
+
+    def _unique_tag(self, prefix: str = "ema_cross_auto") -> str:
+        try:
+            self._tag_counter = (self._tag_counter + 1) % 1000000
+        except Exception:
+            self._tag_counter = 1
+        return f"{prefix}_{self.symbol}_{int(time.time()*1000)}_{self._tag_counter}"
+
+    def _calc_cross(self, prev_rel: Optional[float], rel: Optional[float], strict: bool) -> (bool, bool):
+        try:
+            if prev_rel is None or rel is None:
+                return (False, False)
+            eps = 1e-9
+            if strict:
+                cross_up = (float(prev_rel) < -eps) and (float(rel) > eps)
+                cross_dn = (float(prev_rel) > eps) and (float(rel) < -eps)
+            else:
+                cross_up = (float(prev_rel) <= eps) and (float(rel) > eps)
+                cross_dn = (float(prev_rel) >= -eps) and (float(rel) < -eps)
+            return (cross_up, cross_dn)
+        except Exception:
+            return (False, False)
 
     def _pd_indicator_snapshot(self) -> Optional[Dict[str, Optional[float]]]:
         try:
@@ -83,8 +107,7 @@ class MarketStreamer:
             if self.ctx['DEBUG'] and (ef is not None) and (es is not None):
                 try:
                     rel = float(ef) - float(es)
-                    cross_up = (prev_rel is not None) and (float(prev_rel) <= 0) and (rel > 0)
-                    cross_dn = (prev_rel is not None) and (float(prev_rel) >= 0) and (rel < 0)
+                    cross_up, cross_dn = self._calc_cross(prev_rel, rel, bool(self.ctx.get('STRICT_CROSS_ONLY')))
                     logging.info(
                         f"{self.symbol} bar_close {self.cur_bar.get('t')} | prev_rel={prev_rel} rel={rel} cross_up={cross_up} cross_dn={cross_dn}"
                     )
@@ -92,7 +115,7 @@ class MarketStreamer:
                     pass
             self._last_rel = prev_rel
             if (ef is not None) and (es is not None):
-                # Compute real-only EMAs (exclude synthetic bars) using pandas EWM from first bar
+                # Compute real-only EMAs (exclude synthetic bars) using Pine-style math via compute_indicators
                 ef_r = es_r = None
                 try:
                     with self.ctx['bars_lock']:
@@ -100,22 +123,18 @@ class MarketStreamer:
                     if bars:
                         df = pd.DataFrame(bars)
                         if 'syn' in df.columns:
-                            df_real = df[df.get('syn') != True].copy()
-                        else:
-                            df_real = df.copy()
-                        if df_real.shape[0] >= 1:
-                            df_real = df_real.rename(columns={'c': 'close', 'v': 'volume', 't': 'time', 'o': 'open', 'h': 'high', 'l': 'low'})
-                            ser = pd.to_numeric(df_real['close'], errors='coerce').astype(float)
-                            ef_r = ser.ewm(span=int(self.ctx['EMA_SHORT']), adjust=False).mean().iloc[-1]
-                            es_r = ser.ewm(span=int(self.ctx['EMA_LONG']), adjust=False).mean().iloc[-1]
-                            if pd.isna(ef_r):
-                                ef_r = None
-                            else:
-                                ef_r = float(ef_r)
-                            if pd.isna(es_r):
-                                es_r = None
-                            else:
-                                es_r = float(es_r)
+                            df = df[df.get('syn') != True]
+                        if not df.empty:
+                            df = df.rename(columns={'c': 'close', 'v': 'volume', 't': 'time', 'o': 'open', 'h': 'high', 'l': 'low'})
+                            df['time'] = pd.to_datetime(df['time'], utc=True)
+                            df = df.set_index('time')
+                            ind_real = self.ctx['compute_indicators'](df)
+                            if ind_real.shape[0] >= 1:
+                                last_r = ind_real.iloc[-1]
+                                ef_key = f"ema{self.ctx['EMA_SHORT']}"
+                                es_key = f"ema{self.ctx['EMA_LONG']}"
+                                ef_r = float(last_r.get(ef_key)) if pd.notna(last_r.get(ef_key)) else None
+                                es_r = float(last_r.get(es_key)) if pd.notna(last_r.get(es_key)) else None
                 except Exception:
                     pass
                 # Prefer real EMAs in primary fields when available; also expose both variants
@@ -152,6 +171,11 @@ class MarketStreamer:
         now = time.time()
         if atr_val is None or ef is None or es is None:
             return
+        # Global kill-switch if venue/account disallows trading
+        if self.ctx.get('TRADING_DISABLED'):
+            if self.ctx['DEBUG']:
+                logging.info("Trading disabled: %s", str(self.ctx.get('TRADING_DISABLED_REASON') or 'unknown'))
+            return
         try:
             min_rb = int(self.ctx.get('MIN_REAL_BARS_BEFORE_TRADING', 0) or 0)
             if self._real_bars < min_rb:
@@ -162,8 +186,10 @@ class MarketStreamer:
             pass
         rel = ef - es
         prev_rel = self._last_rel
-        cross_up = (prev_rel is not None) and (prev_rel <= 0) and (rel > 0)
-        cross_dn = (prev_rel is not None) and (prev_rel >= 0) and (rel < 0)
+        cross_up, cross_dn = self._calc_cross(prev_rel, rel, bool(self.ctx.get('STRICT_CROSS_ONLY')))
+        # Optional override to force LONG cross so we don't wait for a natural crossover
+        if self.ctx.get('FORCE_CROSS_UP'):
+            cross_up, cross_dn = True, False
         vwap_long_ok = True
         vwap_short_ok = True
         if self.ctx['USE_VWAP'] and vwap_val is not None:
@@ -189,6 +215,23 @@ class MarketStreamer:
                 int(self.ctx['CONFIRM_BARS'])
             )
         if self.ctx['CONFIRM_BARS'] and self.ctx['CONFIRM_BARS'] > 0:
+            # If forcing cross-up, bypass confirmation waits and enter immediately (still respecting gating)
+            if self.ctx.get('FORCE_CROSS_UP'):
+                if vwap_long_ok and ema_long_ok and (now - self._last_signal_ts >= self.ctx['TRADE_COOLDOWN_SEC']):
+                    self._last_signal_ts = now
+                    logging.info("Forced LONG entry (forceCrossUp enabled); skipping confirmation")
+                    self._place_market_with_brackets(side=0, op=close_px, atr_val=atr_val)
+                else:
+                    if self.ctx['DEBUG']:
+                        reasons = []
+                        if not vwap_long_ok: reasons.append("vwap_long")
+                        if not ema_long_ok: reasons.append("ema_long")
+                        if (now - self._last_signal_ts) < self.ctx['TRADE_COOLDOWN_SEC']: reasons.append("cooldown")
+                        oc = self.ctx['get_open_orders_count'](self.contract_id)
+                        if oc > 0: reasons.append(f"openOrders={oc}")
+                        logging.info("Forced LONG skipped due to: %s", ", ".join(reasons) or "unknown")
+                self._last_rel = rel
+                return
             if cross_up:
                 self._pending_signal = {"dir": "long", "bars_left": int(self.ctx['CONFIRM_BARS'])}
                 logging.info("Cross detected LONG; confirming over %d bars", int(self.ctx['CONFIRM_BARS']))
@@ -245,6 +288,10 @@ class MarketStreamer:
                     if cross_dn:
                         if not vwap_short_ok: reasons.append("vwap_short")
                         if not ema_short_ok: reasons.append("ema_short")
+                        if self.ctx.get('LONG_ONLY'):
+                            reasons.append("long_only")
+                    if self.ctx.get('TRADING_DISABLED'):
+                        reasons.append("trading_disabled")
                     if (now - self._last_signal_ts) < self.ctx['TRADE_COOLDOWN_SEC']:
                         reasons.append("cooldown")
                     if oc > 0:
@@ -313,18 +360,27 @@ class MarketStreamer:
             "Auto-entry signal side=%s op=%.2f size=%d SL=%.2f TP=%.2f (stop_pts=%.4f $/pt=%.4f)",
             "BUY" if side == 0 else "SELL", op, size, sl, tp, stop_points, rp
         )
-        # Try bracket-style payload first if enabled
-        entry_payload = {
+        # Precompute trailing settings (may be used in bracket payload)
+        use_trail = bool(self.ctx['TRAILING_STOP_ENABLED'])
+        trail_points = (atr_val * (self.ctx['ATR_TRAIL_K_LONG'] if side == 0 else self.ctx['ATR_TRAIL_K_SHORT'])) if use_trail else None
+        if trail_points and tick_size and tick_size > 0:
+            trail_points = self.ctx['snap_to_tick'](trail_points, tick_size, decimals)
+
+        # Prepare simple entry payload
+        simple_entry_payload = {
             "accountId": self.ctx['ACCOUNT_ID'],
             "contractId": self.contract_id,
             "type": 2,
             "side": side,
             "size": size,
-            "customTag": f"ema_cross_auto_{int(time.time())}",
+            "customTag": self._unique_tag("ema_cross_auto"),
         }
         used_brackets_payload = False
-        if self.ctx.get('USE_BRACKETS_PAYLOAD') and tick_size and tick_size > 0:
+        # Try bracket-style payload first only if neither Auto-OCO nor Position Brackets are enabled
+        if (not self.ctx.get('AUTO_OCO_ENABLED')) and (not self.ctx.get('POSITION_BRACKETS_ENABLED')) \
+           and self.ctx.get('USE_BRACKETS_PAYLOAD') and tick_size and tick_size > 0:
             try:
+                entry_payload = dict(simple_entry_payload)
                 sl_ticks = int(max(1, round(abs(op - sl) / tick_size)))
                 tp_ticks = int(max(1, round(abs(tp - op) / tick_size)))
                 entry_payload["stopLossBracket"] = {"ticks": sl_ticks, "type": 0}
@@ -346,13 +402,89 @@ class MarketStreamer:
                     )
                 else:
                     logging.info("Bracket entry not accepted, falling back to linked TP/SL: resp=%s", str(resp_try))
-                    entry = resp_try
+                    # Disable bracket payload for subsequent attempts this session
+                    try:
+                        msg = str(resp_try.get("errorMessage") or "")
+                        if "Brackets cannot be used" in msg:
+                            self.ctx['USE_BRACKETS_PAYLOAD'] = False
+                            logging.info("Disabling bracket payload due to venue policy response.")
+                    except Exception:
+                        pass
+                    # Fall back to simple entry without brackets, but ensure a new unique customTag
+                    simple_entry_payload_fallback = dict(simple_entry_payload)
+                    simple_entry_payload_fallback["customTag"] = self._unique_tag("ema_cross_fallback")
+                    entry = self.ctx['api_post'](token, "/api/Order/place", simple_entry_payload_fallback)
+                    # If duplicate custom tag error, retry once with another fresh tag
+                    if (not entry.get("success")) and ("custom tag" in str(entry.get("errorMessage") or "").lower()):
+                        simple_entry_payload_retry = dict(simple_entry_payload_fallback)
+                        simple_entry_payload_retry["customTag"] = self._unique_tag("ema_cross_retry")
+                        entry = self.ctx['api_post'](token, "/api/Order/place", simple_entry_payload_retry)
             except Exception:
-                entry = self.ctx['api_post'](token, "/api/Order/place", entry_payload)
+                # In case of exception, try simple entry with a unique tag
+                simple_entry_payload_exc = dict(simple_entry_payload)
+                simple_entry_payload_exc["customTag"] = self._unique_tag("ema_cross_exc")
+                entry = self.ctx['api_post'](token, "/api/Order/place", simple_entry_payload_exc)
         else:
-            entry = self.ctx['api_post'](token, "/api/Order/place", entry_payload)
+            # No bracket attempt: place simple entry; ensure fresh tag
+            simple_entry_payload_nobr = dict(simple_entry_payload)
+            simple_entry_payload_nobr["customTag"] = self._unique_tag("ema_cross")
+            entry = self.ctx['api_post'](token, "/api/Order/place", simple_entry_payload_nobr)
+            if (not entry.get("success")) and ("custom tag" in str(entry.get("errorMessage") or "").lower()):
+                simple_entry_payload_nobr2 = dict(simple_entry_payload_nobr)
+                simple_entry_payload_nobr2["customTag"] = self._unique_tag("ema_cross_retry")
+                entry = self.ctx['api_post'](token, "/api/Order/place", simple_entry_payload_nobr2)
         entry_id = entry.get("orderId")
         if not entry.get("success") or not entry_id:
+            # Detect fatal venue conditions and trip a local kill-switch
+            try:
+                emsg = str(entry.get("errorMessage") or "")
+                if emsg:
+                    if "account is closed" in emsg.lower():
+                        # record diagnostic
+                        try:
+                            self.ctx['LAST_ORDER_FAIL'] = {
+                                'when': int(time.time()),
+                                'reason': emsg,
+                                'accountId': self.ctx.get('ACCOUNT_ID'),
+                                'contractId': self.contract_id,
+                                'side': side,
+                                'size': size,
+                                'op': op,
+                                'sl': sl,
+                                'tp': tp,
+                                'usedBracketsPayload': bool(used_brackets_payload),
+                                'payloadStyle': ('brackets' if used_brackets_payload else 'simple'),
+                                'response': entry,
+                            }
+                        except Exception:
+                            pass
+                        self.ctx['TRADING_DISABLED'] = True
+                        self.ctx['TRADING_DISABLED_REASON'] = emsg
+                        logging.error(
+                            "Auto entry failed for accountId=%s: %s | Trading disabled for safety.",
+                            str(self.ctx.get('ACCOUNT_ID')), emsg,
+                        )
+                        return
+            except Exception:
+                pass
+            # record non-fatal failure details for diagnostics
+            try:
+                self.ctx['LAST_ORDER_FAIL'] = {
+                    'when': int(time.time()),
+                    'reason': entry.get('errorMessage') or 'unknown',
+                    'accountId': self.ctx.get('ACCOUNT_ID'),
+                    'contractId': self.contract_id,
+                    'side': side,
+                    'size': size,
+                    'op': op,
+                    'sl': sl,
+                    'tp': tp,
+                    'usedBracketsPayload': bool(used_brackets_payload),
+                    'payloadStyle': ('brackets' if used_brackets_payload else 'simple'),
+                    'response': entry,
+                }
+            except Exception:
+                pass
             logging.error("Auto entry order failed: %s", entry)
             return
         use_trail = bool(self.ctx['TRAILING_STOP_ENABLED'])
@@ -377,11 +509,29 @@ class MarketStreamer:
             }
             logging.info("Recorded venue-managed bracket for entry=%s (no child IDs)", str(entry_id))
         else:
-            threading.Thread(
-                target=self._place_brackets_sync,
-                args=(token, entry_id, side, size, tp, sl, use_trail, trail_points, op, stop_points),
-                daemon=True,
-            ).start()
+            if self.ctx.get('AUTO_OCO_ENABLED') or self.ctx.get('POSITION_BRACKETS_ENABLED'):
+                # Venue Auto-OCO will attach TP/SL; record and skip manual child orders
+                cm = self.ctx['contract_map'].get(self.symbol) or {}
+                self.ctx['active_entries'][entry_id] = {
+                    "symbol": self.symbol,
+                    "contractId": self.contract_id,
+                    "side": side,
+                    "size": size,
+                    "entry": op,
+                    "stop_points": float(stop_points),
+                    "tp_id": None,
+                    "sl_id": None,
+                    "be_done": True,
+                    "tickSize": float(cm.get("tickSize") or 0.0),
+                    "decimals": int(cm.get("decimalPlaces") or 2),
+                }
+                logging.info("Venue-managed brackets enabled (Auto-OCO/Position): entry-only; no manual child orders placed.")
+            else:
+                threading.Thread(
+                    target=self._place_brackets_sync,
+                    args=(token, entry_id, side, size, tp, sl, use_trail, trail_points, op, stop_points),
+                    daemon=True,
+                ).start()
 
     def _place_brackets_sync(self, token: str, entry_id: Any, side: int, size: int, tp: float, sl: float,
                               use_trail: bool, trail_points: Optional[float], entry_price: float, stop_points: float):
@@ -464,20 +614,33 @@ class MarketStreamer:
 
     def _ingest(self, t: dt.datetime, price: float, vol: float):
         self.ctx['last_price'][self.symbol] = price
+        # Optional tick log throttle to reduce console spam
         try:
-            bal = self.ctx['account_snapshot'].get("balance")
-            eq = self.ctx['account_snapshot'].get("equity")
-            st = self.ctx['indicator_state'].get(self.symbol) or {}
-            ef = st.get("emaFastReal") or st.get("emaFast")
-            es = st.get("emaSlowReal") or st.get("emaSlow")
-            if ef is not None and es is not None:
-                logging.info(
-                    f"{self.symbol} price: {price:.2f} | EMA{self.ctx['EMA_SHORT']}={self.ctx['fmt_num'](ef)} EMA{self.ctx['EMA_LONG']}={self.ctx['fmt_num'](es)} | bal={self.ctx['fmt_num'](bal)} eq={self.ctx['fmt_num'](eq)}"
-                )
-            else:
-                logging.info(f"{self.symbol} price: {price:.2f} | bal={self.ctx['fmt_num'](bal)} eq={self.ctx['fmt_num'](eq)}")
+            throttle = int(self.ctx.get('PRICE_LOG_THROTTLE_SEC', 0) or 0)
         except Exception:
-            logging.info(f"{self.symbol} price: {price:.2f}")
+            throttle = 0
+        do_log = False
+        if throttle and throttle > 0:
+            now_ts = time.time()
+            if (now_ts - self._last_price_log_ts) >= throttle:
+                self._last_price_log_ts = now_ts
+                do_log = True
+        # Only log if throttled; otherwise suppress per-tick price spam
+        if do_log:
+            try:
+                bal = self.ctx['account_snapshot'].get("balance")
+                eq = self.ctx['account_snapshot'].get("equity")
+                st = self.ctx['indicator_state'].get(self.symbol) or {}
+                ef = st.get("emaFastReal") or st.get("emaFast")
+                es = st.get("emaSlowReal") or st.get("emaSlow")
+                if ef is not None and es is not None:
+                    logging.info(
+                        f"{self.symbol} price: {price:.2f} | EMA{self.ctx['EMA_SHORT']}={self.ctx['fmt_num'](ef)} EMA{self.ctx['EMA_LONG']}={self.ctx['fmt_num'](es)} | bal={self.ctx['fmt_num'](bal)} eq={self.ctx['fmt_num'](eq)}"
+                    )
+                else:
+                    logging.info(f"{self.symbol} price: {price:.2f} | bal={self.ctx['fmt_num'](bal)} eq={self.ctx['fmt_num'](eq)}")
+            except Exception:
+                logging.info(f"{self.symbol} price: {price:.2f}")
         minute = t.replace(second=0, microsecond=0, tzinfo=dt.timezone.utc)
         if self.cur_minute is None:
             self.cur_minute = minute
@@ -505,8 +668,7 @@ class MarketStreamer:
                     ef_tick = alpha_f * float(price) + (1.0 - alpha_f) * float(ef_prev)
                     es_tick = alpha_s * float(price) + (1.0 - alpha_s) * float(es_prev)
                     rel_tick = ef_tick - es_tick
-                    cross_up = (prev_rel <= 0) and (rel_tick > 0)
-                    cross_dn = (prev_rel >= 0) and (rel_tick < 0)
+                    cross_up, cross_dn = self._calc_cross(prev_rel, rel_tick, bool(self.ctx.get('STRICT_CROSS_ONLY')))
                     if not (cross_up or cross_dn):
                         return
                     if getattr(self, "_last_intrabar_minute", None) == self.cur_minute:

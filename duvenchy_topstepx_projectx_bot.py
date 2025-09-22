@@ -93,6 +93,9 @@ TRADE_CFG = (config.get("trade") or {})
 FIXED_TP_POINTS = float(TRADE_CFG.get("tpPoints", 0) or 0)
 FIXED_SL_POINTS = float(TRADE_CFG.get("slPoints", 0) or 0)
 USE_FIXED_TARGETS = bool(TRADE_CFG.get("useFixedTargets", False))
+AUTO_OCO_ENABLED = bool(STRAT.get("autoOCOBrackets", STRAT.get("autoOCOEnabled", False)))
+POSITION_BRACKETS_ENABLED = bool(STRAT.get("positionBrackets", False))
+FORCE_CROSS_UP = bool(STRAT.get("forceCrossUp", False))
 
 ATR = _ATR
 
@@ -208,9 +211,13 @@ def run_server():
         'USE_VWAP': USE_VWAP,
         'REQUIRE_PRICE_ABOVE_EMAS': bool(STRAT.get("requirePriceAboveEMAS", False)),
         'CONFIRM_BARS': int(STRAT.get("confirmBars", 0)),
+        'STRICT_CROSS_ONLY': bool(STRAT.get("strictCrossOnly", False)),
         'INTRABAR_CROSS': bool(STRAT.get("intrabarCross", False)),
         'TRADE_COOLDOWN_SEC': TRADE_COOLDOWN_SEC,
         'TRAILING_STOP_ENABLED': TRAILING_STOP_ENABLED,
+        'AUTO_OCO_ENABLED': AUTO_OCO_ENABLED,
+        'POSITION_BRACKETS_ENABLED': POSITION_BRACKETS_ENABLED,
+        'FORCE_CROSS_UP': FORCE_CROSS_UP,
         'PAD_TICKS': PAD_TICKS,
         'FIXED_TP_POINTS': FIXED_TP_POINTS,
         'FIXED_SL_POINTS': FIXED_SL_POINTS,
@@ -231,6 +238,13 @@ def run_server():
         'ALLOW_SYNTH_WARMUP': True,
         'SYNTH_WARMUP_MINUTES': int(min(300, max(0, SYNTH_WARMUP_MINUTES))),
         'MIN_REAL_BARS_BEFORE_TRADING': int(max(0, MIN_REAL_BARS_BEFORE_TRADING)),
+        # safety gates
+        'TRADING_DISABLED': False,
+        'TRADING_DISABLED_REASON': None,
+        # last failed order diagnostic blob
+        'LAST_ORDER_FAIL': None,
+        # allow auto re-enable when account reopens
+        'AUTO_REENABLE_TRADING_ON_OPEN': True,
     }
     ctx['monitor_oco_orders'] = make_monitor_oco_orders(ctx)
     ctx['monitor_account_snapshot'] = make_monitor_account_snapshot(ctx)

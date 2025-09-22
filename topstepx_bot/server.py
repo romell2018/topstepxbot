@@ -191,13 +191,57 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
         symbol = (request.args.get("symbol") or SYMBOL).upper()
         real_only = str(request.args.get("realOnly", "0")).lower() in ("1", "true", "yes")
         state = indicator_state.get(symbol) or {}
+        # Compute bar counts and real bar progress
+        try:
+            with _bars_lock:
+                bars = list(bars_by_symbol.get(symbol, []))
+            total_bars = len(bars)
+            syn_bars = sum(1 for b in bars if b.get('syn') is True)
+            real_bars = max(0, total_bars - syn_bars)
+        except Exception:
+            total_bars = syn_bars = real_bars = 0
+        rb_stream = None
+        try:
+            ms = (streamers or {}).get(symbol)
+            rb_stream = int(getattr(ms, "_real_bars", 0)) if ms else None
+        except Exception:
+            rb_stream = None
+        out = dict(state)
         if real_only:
-            out = dict(state)
             ef_r = out.get("emaFastReal"); es_r = out.get("emaSlowReal")
             out["emaFast"] = ef_r if ef_r is not None else None
             out["emaSlow"] = es_r if es_r is not None else None
-            return jsonify({"symbol": symbol, **out})
-        return jsonify({"symbol": symbol, **state})
+        # Annotate with counts and which variant is primary
+        try:
+            uses_real_primary = (out.get("emaFast") == (out.get("emaFastReal") if out.get("emaFastReal") is not None else out.get("emaFast")))
+        except Exception:
+            uses_real_primary = False
+        out.update({
+            "barCounts": {"total": total_bars, "real": real_bars, "synthetic": syn_bars},
+            "realBars": rb_stream if rb_stream is not None else real_bars,
+            "usesRealPrimary": bool(out.get("emaFastReal") is not None and out.get("emaSlowReal") is not None),
+        })
+        return jsonify({"symbol": symbol, **out})
+
+    @app.get("/wiring")
+    async def wiring():
+        try:
+            synth_min = int(ctx.get('SYNTH_WARMUP_MINUTES') or 0)
+        except Exception:
+            synth_min = 0
+        info = {
+            "symbol": SYMBOL,
+            "accountId": ACCOUNT_ID,
+            "EMA_SHORT": int(ctx.get('EMA_SHORT')),
+            "EMA_LONG": int(ctx.get('EMA_LONG')),
+            "EMA_SOURCE": ctx.get('EMA_SOURCE', 'close'),
+            "RTH_ONLY": bool(ctx.get('RTH_ONLY', False)),
+            "USE_VWAP": bool(ctx.get('USE_VWAP', False)),
+            "LIVE_FLAG": bool(LIVE_FLAG),
+            "SYNTH_WARMUP_MINUTES": synth_min,
+            "MIN_REAL_BARS_BEFORE_TRADING": int(ctx.get('MIN_REAL_BARS_BEFORE_TRADING', 0) or 0),
+        }
+        return jsonify(info)
 
     def get_open_orders_count(contract_id: Any = None) -> int:
         token = get_token()
@@ -224,6 +268,30 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
         cnt = get_open_orders_count()
         return jsonify({"accountId": ACCOUNT_ID, "symbol": SYMBOL, "openOrders": cnt, "active": cnt > 0})
 
+    @app.get("/diag/status")
+    async def diag_status():
+        return jsonify({
+            'accountId': ACCOUNT_ID,
+            'symbol': SYMBOL,
+            'tradingDisabled': bool(ctx.get('TRADING_DISABLED')),
+            'reason': ctx.get('TRADING_DISABLED_REASON'),
+            'accountState': ctx.get('ACCOUNT_STATE'),
+            'balance': ctx.get('account_snapshot', {}).get('balance'),
+            'equity': ctx.get('account_snapshot', {}).get('equity'),
+        })
+
+    @app.get("/diag/last-order-fail")
+    async def diag_last_order_fail():
+        lof = ctx.get('LAST_ORDER_FAIL')
+        return jsonify(lof or {})
+
+    @app.post("/trading/enable")
+    async def trading_enable():
+        # manual override to clear kill-switch
+        ctx['TRADING_DISABLED'] = False
+        ctx['TRADING_DISABLED_REASON'] = None
+        return jsonify({"ok": True})
+
     @app.before_serving
     async def startup():
         # Load contracts and start monitors
@@ -231,6 +299,43 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
         asyncio.create_task(ctx['monitor_oco_orders']())
         asyncio.create_task(ctx['monitor_break_even']())
         asyncio.create_task(ctx['monitor_account_snapshot']())
+        # Proactive account-state gate before warmup/stream
+        try:
+            tok0 = get_token()
+            if tok0:
+                acct0 = get_account_info(tok0) or {}
+                def _val_s(obj, key):
+                    v = obj.get(key)
+                    return str(v).strip().lower() if v is not None else None
+                closed = False
+                reason = None
+                try:
+                    aid = acct0.get('id') or acct0.get('accountId') or acct0.get('tradingAccountId')
+                    aname = acct0.get('name') or acct0.get('accountName') or acct0.get('displayName')
+                    logging.info("Startup account snapshot | accountId=%s name=%s", str(aid), str(aname))
+                except Exception:
+                    pass
+                for kb in ('isClosed', 'closed', 'tradingDisabled', 'disabled'):
+                    vb = acct0.get(kb)
+                    if isinstance(vb, bool) and vb:
+                        closed = True
+                        reason = f"{kb}=true"
+                        break
+                if not closed:
+                    for ks in ('status', 'state', 'accountStatus', 'tradingStatus', 'lifecycleState'):
+                        vs = _val_s(acct0, ks)
+                        if not vs:
+                            continue
+                        if any(term in vs for term in ('closed', 'suspend', 'disable', 'locked', 'terminated')):
+                            closed = True
+                            reason = f"{ks}={vs}"
+                            break
+                if closed:
+                    ctx['TRADING_DISABLED'] = True
+                    ctx['TRADING_DISABLED_REASON'] = reason or 'account closed'
+                    logging.error("Trading disabled: %s", ctx['TRADING_DISABLED_REASON'])
+        except Exception:
+            pass
         # Resolve contract
         contract = (contract_map.get(SYMBOL)
                     or contract_map.get(f"US.{SYMBOL}")
