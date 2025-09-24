@@ -23,6 +23,7 @@ from topstepx_bot.monitors import (
     make_monitor_oco_orders,
     make_monitor_account_snapshot,
     make_monitor_break_even,
+    make_monitor_synth_trailing,
     make_get_open_orders_count,
 )
 from topstepx_bot.risk import (
@@ -96,6 +97,11 @@ USE_FIXED_TARGETS = bool(TRADE_CFG.get("useFixedTargets", False))
 AUTO_OCO_ENABLED = bool(STRAT.get("autoOCOBrackets", STRAT.get("autoOCOEnabled", False)))
 POSITION_BRACKETS_ENABLED = bool(STRAT.get("positionBrackets", False))
 FORCE_CROSS_UP = bool(STRAT.get("forceCrossUp", False))
+SYNTH_TRAILING_ENABLED = bool(STRAT.get("syntheticTrailingEnabled", True))
+SYNTH_TRAIL_MIN_TICKS = int(STRAT.get("syntheticTrailMinTicks", 1))
+SYNTH_TRAIL_POLL_SEC = float((config.get("runtime") or {}).get("synth_trail_poll_sec", 0.5))
+FORCE_NATIVE_TRAIL = bool(STRAT.get("forceNativeTrailing", False))
+FORCE_FIXED_TRAIL_TICKS = bool(STRAT.get("forceFixedTrailTicks", False))
 
 ATR = _ATR
 
@@ -218,6 +224,13 @@ def run_server():
         'AUTO_OCO_ENABLED': AUTO_OCO_ENABLED,
         'POSITION_BRACKETS_ENABLED': POSITION_BRACKETS_ENABLED,
         'FORCE_CROSS_UP': FORCE_CROSS_UP,
+        'SYNTH_TRAILING_ENABLED': SYNTH_TRAILING_ENABLED,
+        'SYNTH_TRAIL_MIN_TICKS': int(max(1, SYNTH_TRAIL_MIN_TICKS)),
+        'SYNTH_TRAIL_POLL_SEC': max(0.25, float(SYNTH_TRAIL_POLL_SEC)),
+        'FORCE_NATIVE_TRAIL': FORCE_NATIVE_TRAIL,
+        # fixed native trailing distance in ticks (type 5 orders)
+        'TRAIL_TICKS_FIXED': int(STRAT.get('trailDistanceTicks', 5)),
+        'FORCE_FIXED_TRAIL_TICKS': bool(FORCE_FIXED_TRAIL_TICKS),
         'PAD_TICKS': PAD_TICKS,
         'FIXED_TP_POINTS': FIXED_TP_POINTS,
         'FIXED_SL_POINTS': FIXED_SL_POINTS,
@@ -245,10 +258,13 @@ def run_server():
         'LAST_ORDER_FAIL': None,
         # allow auto re-enable when account reopens
         'AUTO_REENABLE_TRADING_ON_OPEN': True,
+        # capability toggle: disable native trailing; use synthetic trailing only
+        'NATIVE_TRAIL_SUPPORTED': False,
     }
     ctx['monitor_oco_orders'] = make_monitor_oco_orders(ctx)
     ctx['monitor_account_snapshot'] = make_monitor_account_snapshot(ctx)
     ctx['monitor_break_even'] = make_monitor_break_even(ctx)
+    ctx['monitor_synth_trailing'] = make_monitor_synth_trailing(ctx)
     ctx['get_open_orders_count'] = make_get_open_orders_count(ctx)
     ctx['MarketStreamer'] = lambda symbol, contract_id, unit=2, unit_n=1: _MarketStreamer(ctx, symbol, contract_id, unit, unit_n)
     global app

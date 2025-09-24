@@ -36,6 +36,11 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
         tp = data.get("tp")
         sl = data.get("sl")
         symbol = data.get("symbol", "").upper()
+        use_trail = bool(data.get("useTrail", False))
+        try:
+            trail_ticks_req = int(data.get("trailTicks")) if data.get("trailTicks") is not None else None
+        except Exception:
+            trail_ticks_req = None
         if not symbol:
             symbol = SYMBOL
 
@@ -116,15 +121,102 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
             "linkedOrderId": entry_id,
         })
         await asyncio.sleep(0.3)
-        sl_order = api_post(token, "/api/Order/place", {
-            "accountId": ACCOUNT_ID,
-            "contractId": contract_id,
-            "type": 4,
-            "side": 1 - side,
-            "size": size,
-            "stopPrice": sl,
-            "linkedOrderId": entry_id,
-        })
+        sl_order = None
+        sl_is_trailing = False
+        if use_trail:
+            # Try native trailing stop (type=5) using several variants
+            try:
+                trail_ticks = int(max(1, int(trail_ticks_req if trail_ticks_req is not None else int(ctx.get('TRAIL_TICKS_FIXED', 5)))) )
+            except Exception:
+                trail_ticks = 5
+            stop_side = 1 - side
+            # compute absolute start price when possible
+            stop_init = None
+            try:
+                if op is not None and tick_size and float(tick_size) > 0:
+                    offset_points = float(abs(int(trail_ticks))) * float(tick_size)
+                    # protect long -> SELL stop below OP; protect short -> BUY stop above OP
+                    stop_init = float(op) - offset_points if stop_side == 1 else float(op) + offset_points
+                    try:
+                        stop_init = snap_to_tick(float(stop_init), float(tick_size), int(decimals))
+                    except Exception:
+                        pass
+            except Exception:
+                stop_init = None
+
+            base = {
+                "accountId": ACCOUNT_ID,
+                "contractId": contract_id,
+                "type": 5,
+                "side": int(stop_side),
+                "size": int(size),
+                "linkedOrderId": entry_id,
+            }
+            attempts = []
+            # signed and positive trail ticks variants
+            try:
+                t_signed_pos = int(trail_ticks)
+                t_signed_neg = -int(trail_ticks)
+            except Exception:
+                t_signed_pos = int(trail_ticks)
+                t_signed_neg = -int(trail_ticks)
+            attempts.append(("trailticks+", dict(base, trailTicks=int(t_signed_pos))))
+            attempts.append(("trailticks-", dict(base, trailTicks=int(t_signed_neg))))
+            if stop_init is not None:
+                attempts.append(("distanceprice", dict(base, distancePrice=float(stop_init))))
+                attempts.append(("trailprice", dict(base, trailPrice=float(stop_init))))
+            attempts.append(("traildistance", dict(base, trailDistance=int(trail_ticks))))
+            attempts.append(("distance", dict(base, distance=int(trail_ticks))))
+            attempts.append(("distance+traildistance", dict(base, distance=int(trail_ticks), trailDistance=int(trail_ticks))))
+            attempts.append(("distanceticks", dict(base, distanceTicks=int(trail_ticks))))
+            attempts.append(("trailingdistance", dict(base, trailingDistance=int(trail_ticks))))
+
+            preferred = str(ctx.get('TRAIL_VARIANT') or '').strip().lower()
+            if preferred:
+                attempts.sort(key=lambda x: (x[0] != preferred,))
+
+            # diagnostic buffer of trail attempts
+            trail_log = ctx.setdefault('LAST_TRAIL_ATTEMPTS', [])
+            for name, payload in attempts:
+                resp = api_post(token, "/api/Order/place", payload)
+                try:
+                    rec = {
+                        'ts': int(time.time()),
+                        'variant': name,
+                        'payloadKeys': sorted(list(payload.keys())),
+                        'trailFields': {k: payload.get(k) for k in ('trailTicks','trailDistance','distance','distanceTicks','trailingDistance','trailPrice','distancePrice','stopPrice') if k in payload},
+                        'resp': {'success': resp.get('success'), 'orderId': resp.get('orderId'), 'errorCode': resp.get('errorCode'), 'errorMessage': resp.get('errorMessage')},
+                        'linkedId': entry_id,
+                    }
+                    trail_log.append(rec)
+                    if len(trail_log) > 50:
+                        del trail_log[:len(trail_log)-50]
+                    ctx['LAST_TRAIL_ATTEMPTS'] = trail_log
+                except Exception:
+                    pass
+                if resp.get("success") and resp.get("orderId"):
+                    sl_order = resp
+                    sl_is_trailing = True
+                    # Remember working variant for future preference
+                    try:
+                        ctx['TRAIL_VARIANT'] = name
+                    except Exception:
+                        pass
+                    break
+            # slight cooldown between child orders
+            await asyncio.sleep(0.2)
+
+        if sl_order is None:
+            # Fallback to fixed stop
+            sl_order = api_post(token, "/api/Order/place", {
+                "accountId": ACCOUNT_ID,
+                "contractId": contract_id,
+                "type": 4,
+                "side": 1 - side,
+                "size": size,
+                "stopPrice": sl,
+                "linkedOrderId": entry_id,
+            })
         oco_orders[entry_id] = [tp_order.get("orderId"), sl_order.get("orderId")]
         return jsonify({
             "entryOrderId": entry_id,
@@ -136,7 +228,8 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
             "balance": balance,
             "maximum_loss": maximum_loss,
             "risk_budget": risk_budget,
-            "message": "OCO placed",
+            "message": "OCO placed (trailing SL)" if sl_is_trailing else "OCO placed",
+            "slIsTrailing": bool(sl_is_trailing),
         })
 
     @app.route("/place-oco", methods=["POST"])
@@ -179,6 +272,14 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
             except Exception:
                 pass
         return jsonify({"symbol": symbol, "bars": out})
+
+    @app.get("/diag/trail")
+    async def diag_trail():
+        try:
+            attempts = ctx.get('LAST_TRAIL_ATTEMPTS') or []
+            return jsonify({"count": len(attempts), "attempts": attempts})
+        except Exception:
+            return jsonify({"count": 0, "attempts": []})
 
     @app.get("/price")
     async def get_price():
@@ -298,6 +399,7 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
         ctx['load_contracts']()
         asyncio.create_task(ctx['monitor_oco_orders']())
         asyncio.create_task(ctx['monitor_break_even']())
+        asyncio.create_task(ctx['monitor_synth_trailing']())
         asyncio.create_task(ctx['monitor_account_snapshot']())
         # Proactive account-state gate before warmup/stream
         try:
