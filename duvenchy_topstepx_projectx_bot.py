@@ -98,7 +98,23 @@ FIXED_SL_POINTS = float(TRADE_CFG.get("slPoints", 0) or 0)
 USE_FIXED_TARGETS = bool(TRADE_CFG.get("useFixedTargets", False))
 AUTO_OCO_ENABLED = bool(STRAT.get("autoOCOBrackets", STRAT.get("autoOCOEnabled", False)))
 POSITION_BRACKETS_ENABLED = bool(STRAT.get("positionBrackets", False))
-FORCE_CROSS_UP = bool(STRAT.get("forceCrossUp", False))
+def _to_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return str(v).strip().lower() in ("1","true","yes","on","y")
+    return bool(v)
+
+def _bool_any(d: Dict[str, any], keys, default=False) -> bool:
+    for k in keys:
+        if k in d and d.get(k) is not None:
+            return _to_bool(d.get(k))
+    return bool(default)
+
+# Accept multiple aliases for this switch so config can use crossup/crossUp/forceCrossUp
+FORCE_CROSS_UP = _bool_any(STRAT, ["forceCrossUp", "crossUp", "crossup", "force_cross_up"], False)
 SYNTH_TRAILING_ENABLED = bool(STRAT.get("syntheticTrailingEnabled", True))
 SYNTH_TRAIL_MIN_TICKS = int(STRAT.get("syntheticTrailMinTicks", 1))
 SYNTH_TRAIL_POLL_SEC = float((config.get("runtime") or {}).get("synth_trail_poll_sec", 0.5))
@@ -302,6 +318,13 @@ def run_server():
         # capability toggle: disable native trailing; use synthetic trailing only
         'NATIVE_TRAIL_SUPPORTED': False,
     }
+    try:
+        logging.info(
+            "Strategy switches | forceCrossUp=%s longOnly=%s nativeTrailOnly=%s tvMode=%s",
+            str(FORCE_CROSS_UP), str(LONG_ONLY), str(bool(STRAT.get('onlyNativeTrailing', False))), str(bool(STRAT.get('tvTrailingEnabled', False)))
+        )
+    except Exception:
+        pass
     ctx['monitor_oco_orders'] = make_monitor_oco_orders(ctx)
     ctx['monitor_account_snapshot'] = make_monitor_account_snapshot(ctx)
     ctx['monitor_break_even'] = make_monitor_break_even(ctx)
