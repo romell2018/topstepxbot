@@ -25,6 +25,8 @@ from topstepx_bot.monitors import (
     make_monitor_break_even,
     make_monitor_synth_trailing,
     make_get_open_orders_count,
+    make_monitor_profit_trail,
+    make_monitor_tv_trailing,
 )
 from topstepx_bot.risk import (
     risk_per_point as risk_per_point_module,
@@ -102,6 +104,31 @@ SYNTH_TRAIL_MIN_TICKS = int(STRAT.get("syntheticTrailMinTicks", 1))
 SYNTH_TRAIL_POLL_SEC = float((config.get("runtime") or {}).get("synth_trail_poll_sec", 0.5))
 FORCE_NATIVE_TRAIL = bool(STRAT.get("forceNativeTrailing", False))
 FORCE_FIXED_TRAIL_TICKS = bool(STRAT.get("forceFixedTrailTicks", False))
+
+# Profit-activated trailing config
+PROFIT_TRAIL_ENABLED = bool(STRAT.get("profitTrailEnabled", True))
+TRAIL_POINTS_LONG = float(STRAT.get("trailPointsLong", STRAT.get("trailPoints", 0.0)) or 0.0)
+TRAIL_POINTS_SHORT = float(STRAT.get("trailPointsShort", STRAT.get("trailPoints", 0.0)) or 0.0)
+TRAIL_OFFSET_LONG = float(STRAT.get("trailOffsetLong", STRAT.get("trailOffset", 0.0)) or 0.0)
+TRAIL_OFFSET_SHORT = float(STRAT.get("trailOffsetShort", STRAT.get("trailOffset", 0.0)) or 0.0)
+
+# TradingView-style trailing config (accepts underscore or camelCase variants)
+def _cfg2(name_camel: str, name_us: str, default: float = 0.0) -> float:
+    try:
+        v = STRAT.get(name_camel)
+        if v is None:
+            v = STRAT.get(name_us)
+        return float(v if v is not None else default)
+    except Exception:
+        return float(default)
+
+TV_TRAILING_ENABLED = bool(STRAT.get("tvTrailingEnabled", False))
+TV_TRAIL_POINTS_LONG = _cfg2("trailPointsLong", "trail_points_long", 0.0)
+TV_TRAIL_POINTS_SHORT = _cfg2("trailPointsShort", "trail_points_short", 0.0)
+TV_TRAIL_OFFSET_LONG = _cfg2("trailOffsetLong", "trail_offset_long", 0.0)
+TV_TRAIL_OFFSET_SHORT = _cfg2("trailOffsetShort", "trail_offset_short", 0.0)
+TV_TP_POINTS_LONG = _cfg2("tpPointsLong", "tp_points_long", 0.0)
+TV_TP_POINTS_SHORT = _cfg2("tpPointsShort", "tp_points_short", 0.0)
 
 ATR = _ATR
 
@@ -245,6 +272,20 @@ def run_server():
         'risk_per_point': risk_per_point,
         'get_risk_dollars': get_risk_dollars,
         'compute_indicators': compute_indicators,
+        # TradingView-style trailing
+        'TV_TRAILING_ENABLED': bool(TV_TRAILING_ENABLED),
+        'TV_TRAIL_POINTS_LONG': float(TV_TRAIL_POINTS_LONG),
+        'TV_TRAIL_POINTS_SHORT': float(TV_TRAIL_POINTS_SHORT),
+        'TV_TRAIL_OFFSET_LONG': float(TV_TRAIL_OFFSET_LONG),
+        'TV_TRAIL_OFFSET_SHORT': float(TV_TRAIL_OFFSET_SHORT),
+        'TV_TP_POINTS_LONG': float(TV_TP_POINTS_LONG),
+        'TV_TP_POINTS_SHORT': float(TV_TP_POINTS_SHORT),
+        # profit-activated trailing settings (in points)
+        'PROFIT_TRAIL_ENABLED': PROFIT_TRAIL_ENABLED,
+        'TRAIL_POINTS_LONG': TRAIL_POINTS_LONG,
+        'TRAIL_POINTS_SHORT': TRAIL_POINTS_SHORT,
+        'TRAIL_OFFSET_LONG': TRAIL_OFFSET_LONG,
+        'TRAIL_OFFSET_SHORT': TRAIL_OFFSET_SHORT,
         # bracket entry support
         'USE_BRACKETS_PAYLOAD': bool((config.get('trade') or {}).get('useBracketsPayload', True)),
         # warmup behavior
@@ -265,6 +306,8 @@ def run_server():
     ctx['monitor_account_snapshot'] = make_monitor_account_snapshot(ctx)
     ctx['monitor_break_even'] = make_monitor_break_even(ctx)
     ctx['monitor_synth_trailing'] = make_monitor_synth_trailing(ctx)
+    ctx['monitor_profit_trail'] = make_monitor_profit_trail(ctx)
+    ctx['monitor_tv_trailing'] = make_monitor_tv_trailing(ctx)
     ctx['get_open_orders_count'] = make_get_open_orders_count(ctx)
     ctx['MarketStreamer'] = lambda symbol, contract_id, unit=2, unit_n=1: _MarketStreamer(ctx, symbol, contract_id, unit, unit_n)
     global app

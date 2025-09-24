@@ -1,8 +1,37 @@
 import requests
 import logging
+import time
+import threading
+
+
+# Simple in-process token cache with throttle/backoff to avoid 429 storms
+_token_lock = threading.Lock()
+_token_cache = {
+    'token': None,           # last good token
+    'ts': 0.0,               # when token was obtained
+    'ttl': 60.0 * 30,        # assume token valid for 30 minutes (adjust if needed)
+    'last_attempt': 0.0,     # last login attempt ts
+    'min_interval': 10.0,    # don't hammer login more often than this (sec)
+    'backoff_until': 0.0,    # if 429, wait until this ts before next login
+}
 
 
 def get_token(api_url: str, username: str, api_key: str):
+    now = time.time()
+    with _token_lock:
+        # Use cached token if still fresh
+        if _token_cache['token'] and (now - _token_cache['ts'] < _token_cache['ttl']):
+            return _token_cache['token']
+        # Respect backoff after a 429
+        if now < _token_cache['backoff_until']:
+            # During backoff, return whatever we have (possibly None)
+            return _token_cache['token']
+        # Throttle login frequency across concurrent callers
+        if (now - _token_cache['last_attempt']) < _token_cache['min_interval']:
+            return _token_cache['token']
+        _token_cache['last_attempt'] = now
+
+    # Perform login outside the lock
     try:
         res = requests.post(
             f"{api_url}/api/Auth/loginKey",
@@ -11,12 +40,41 @@ def get_token(api_url: str, username: str, api_key: str):
             timeout=10,
             verify=False,
         )
-        res.raise_for_status()
+        try:
+            res.raise_for_status()
+        except requests.exceptions.HTTPError as he:  # type: ignore
+            # Handle 429 explicitly with a backoff window
+            status = getattr(he.response, 'status_code', None)
+            if status == 429:
+                retry_after = 0
+                try:
+                    ra = he.response.headers.get('Retry-After') if he.response is not None else None
+                    if ra is not None:
+                        retry_after = int(float(ra))
+                except Exception:
+                    retry_after = 0
+                backoff = max(30.0, float(retry_after))
+                with _token_lock:
+                    _token_cache['backoff_until'] = time.time() + backoff
+                logging.error(f"Auth error: 429 Too Many Requests. Backing off for {int(backoff)}s")
+                return _token_cache['token']
+            # Other HTTP errors
+            logging.error(f"Auth error: {he}")
+            return _token_cache['token']
         data = res.json()
-        return data.get("token") if data.get("success") else None
+        token = data.get("token") if data.get("success") else None
+        if token:
+            with _token_lock:
+                _token_cache['token'] = token
+                _token_cache['ts'] = time.time()
+                # Reset backoff on success
+                _token_cache['backoff_until'] = 0.0
+        else:
+            logging.error("Auth error: loginKey returned no token")
+        return token
     except Exception as e:
         logging.error(f"Auth error: {e}")
-        return None
+        return _token_cache['token']
 
 
 def api_post(api_url: str, token: str, endpoint: str, payload: dict):

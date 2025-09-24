@@ -307,7 +307,20 @@ class MarketStreamer:
         cm = self.ctx['contract_map'].get(self.symbol) or {}
         tick_size = float(cm.get("tickSize") or 0.0)
         decimals = int(cm.get("decimalPlaces") or 2)
-        if self.ctx['USE_FIXED_TARGETS'] and self.ctx['FIXED_TP_POINTS'] > 0 and self.ctx['FIXED_SL_POINTS'] > 0:
+        tv_mode = bool(self.ctx.get('TV_TRAILING_ENABLED', False))
+        # TradingView-style: arm SL at entry +/- offset, optional TP; else fall back to fixed/ATR
+        if tv_mode:
+            if side == 0:
+                stop_points = float(self.ctx.get('TV_TRAIL_OFFSET_LONG', 0.0) or 0.0)
+                tgt_points = float(self.ctx.get('TV_TP_POINTS_LONG', 0.0) or 0.0)
+                sl = op - stop_points
+                tp = op + tgt_points if tgt_points and tgt_points > 0 else None
+            else:
+                stop_points = float(self.ctx.get('TV_TRAIL_OFFSET_SHORT', 0.0) or 0.0)
+                tgt_points = float(self.ctx.get('TV_TP_POINTS_SHORT', 0.0) or 0.0)
+                sl = op + stop_points
+                tp = op - tgt_points if tgt_points and tgt_points > 0 else None
+        elif self.ctx['USE_FIXED_TARGETS'] and self.ctx['FIXED_TP_POINTS'] > 0 and self.ctx['FIXED_SL_POINTS'] > 0:
             if side == 0:
                 stop_points = float(self.ctx['FIXED_SL_POINTS'])
                 tgt_points = float(self.ctx['FIXED_TP_POINTS'])
@@ -329,7 +342,7 @@ class MarketStreamer:
                 tgt_points = stop_points * 2.0
                 sl = op + stop_points
                 tp = op - tgt_points
-        if self.ctx['PAD_TICKS'] and tick_size and tick_size > 0:
+        if (not tv_mode) and self.ctx['PAD_TICKS'] and tick_size and tick_size > 0:
             pad_dist = self.ctx['PAD_TICKS'] * tick_size
             if side == 0:
                 sl -= pad_dist
@@ -337,8 +350,8 @@ class MarketStreamer:
             else:
                 sl += pad_dist
                 tp -= pad_dist
-        sl = self.ctx['snap_to_tick'](sl, tick_size, decimals)
-        tp = self.ctx['snap_to_tick'](tp, tick_size, decimals)
+        sl = self.ctx['snap_to_tick'](sl, tick_size, decimals) if sl is not None else None
+        tp = self.ctx['snap_to_tick'](tp, tick_size, decimals) if tp is not None else None
         rp = self.ctx['risk_per_point'](self.symbol, self.contract_id)
         risk_dollars = self.ctx['get_risk_dollars']()
         try:
@@ -356,12 +369,22 @@ class MarketStreamer:
                 atr_val, stop_points, rp, risk_dollars
             )
             return
-        logging.info(
-            "Auto-entry signal side=%s op=%.2f size=%d SL=%.2f TP=%.2f (stop_pts=%.4f $/pt=%.4f)",
-            "BUY" if side == 0 else "SELL", op, size, sl, tp, stop_points, rp
-        )
+        try:
+            if tp is not None and sl is not None:
+                logging.info(
+                    "Auto-entry signal side=%s op=%.2f size=%d SL=%.2f TP=%.2f (stop_pts=%.4f $/pt=%.4f)",
+                    "BUY" if side == 0 else "SELL", op, size, sl, tp, stop_points, rp
+                )
+            elif sl is not None:
+                logging.info(
+                    "Auto-entry signal side=%s op=%.2f size=%d SL=%.2f (stop_pts=%.4f $/pt=%.4f) TP=None",
+                    "BUY" if side == 0 else "SELL", op, size, sl, stop_points, rp
+                )
+        except Exception:
+            pass
         # Precompute trailing settings (may be used in bracket payload)
-        use_trail = bool(self.ctx['TRAILING_STOP_ENABLED'])
+        # Disable native trailing when TV-mode is enabled, or when profit-activated trailing is on
+        use_trail = (not tv_mode) and bool(self.ctx['TRAILING_STOP_ENABLED']) and (not bool(self.ctx.get('PROFIT_TRAIL_ENABLED', False)))
         trail_points = (atr_val * (self.ctx['ATR_TRAIL_K_LONG'] if side == 0 else self.ctx['ATR_TRAIL_K_SHORT'])) if use_trail else None
         trail_ticks = None
         if use_trail and trail_points and tick_size and tick_size > 0:
@@ -387,25 +410,28 @@ class MarketStreamer:
         }
         used_brackets_payload = False
         # Try bracket-style payload first only if neither Auto-OCO nor Position Brackets are enabled
-        if (not self.ctx.get('AUTO_OCO_ENABLED')) and (not self.ctx.get('POSITION_BRACKETS_ENABLED')) \
+        if (not tv_mode) and (not self.ctx.get('AUTO_OCO_ENABLED')) and (not self.ctx.get('POSITION_BRACKETS_ENABLED')) \
            and self.ctx.get('USE_BRACKETS_PAYLOAD') and tick_size and tick_size > 0:
             try:
                 entry_payload = dict(simple_entry_payload)
-                sl_ticks = int(max(1, round(abs(op - sl) / tick_size)))
-                tp_ticks = int(max(1, round(abs(tp - op) / tick_size)))
+                sl_ticks = int(max(1, round(abs(op - sl) / tick_size))) if sl is not None else None
+                tp_ticks = int(max(1, round(abs(tp - op) / tick_size))) if tp is not None else None
                 # Signed ticks per venue: for LONG, SL ticks < 0 and TP ticks > 0; for SHORT, SL ticks > 0 and TP ticks < 0
-                sl_ticks_signed = -sl_ticks if side == 0 else sl_ticks
-                tp_ticks_signed = tp_ticks if side == 0 else -tp_ticks
+                sl_ticks_signed = (-sl_ticks if side == 0 else sl_ticks) if sl_ticks is not None else None
+                tp_ticks_signed = (tp_ticks if side == 0 else -tp_ticks) if tp_ticks is not None else None
                 # Use correct order type codes: Stop=4, Limit=1
                 native_trail_ok = bool(self.ctx.get('NATIVE_TRAIL_SUPPORTED') or self.ctx.get('FORCE_NATIVE_TRAIL'))
                 # If trailing is enabled, prefer adding native trail distance and omit fixed SL to avoid mixing
                 if use_trail and tick_size and tick_size > 0:
                     # Include only TP bracket in entry; place trailing as a linked child after entry acceptance
-                    entry_payload["takeProfitBracket"] = {"ticks": tp_ticks_signed, "type": 1}
+                    if tp_ticks_signed is not None:
+                        entry_payload["takeProfitBracket"] = {"ticks": tp_ticks_signed, "type": 1}
                 else:
                     # No native trailing: use classic TP + SL brackets
-                    entry_payload["stopLossBracket"] = {"ticks": sl_ticks_signed, "type": 4}
-                    entry_payload["takeProfitBracket"] = {"ticks": tp_ticks_signed, "type": 1}
+                    if sl_ticks_signed is not None:
+                        entry_payload["stopLossBracket"] = {"ticks": sl_ticks_signed, "type": 4}
+                    if tp_ticks_signed is not None:
+                        entry_payload["takeProfitBracket"] = {"ticks": tp_ticks_signed, "type": 1}
                 resp_try = self.ctx['api_post'](token, "/api/Order/place", entry_payload)
                 if resp_try.get("success") and resp_try.get("orderId"):
                     entry = resp_try
@@ -676,7 +702,7 @@ class MarketStreamer:
             pass
         return None
 
-    def _place_brackets_sync(self, token: str, entry_id: Any, side: int, size: int, tp: float, sl: float,
+    def _place_brackets_sync(self, token: str, entry_id: Any, side: int, size: int, tp: float | None, sl: float | None,
                               use_trail: bool, trail_points: Optional[float], entry_price: float, stop_points: float):
         try:
             time.sleep(0.25)
@@ -684,25 +710,27 @@ class MarketStreamer:
                 linked_id = int(str(entry_id))
             except Exception:
                 linked_id = entry_id
-            logging.info("Placing TP limit @ %.4f linked to %s", tp, entry_id)
-            tp_payload = {
-                "accountId": self.ctx['ACCOUNT_ID'],
-                "contractId": self.contract_id,
-                "type": 1,
-                "side": 1 - side,
-                "size": size,
-                "limitPrice": tp,
-                "linkedOrderId": linked_id,
-            }
-            tp_order = self.ctx['api_post'](token, "/api/Order/place", tp_payload)
-            if not tp_order.get("success") or not tp_order.get("orderId"):
-                logging.warning(f"TP place failed: payload={tp_payload} resp={tp_order}")
-                return
+            tp_order = {"success": True, "orderId": None}
+            if tp is not None:
+                logging.info("Placing TP limit @ %.4f linked to %s", tp, entry_id)
+                tp_payload = {
+                    "accountId": self.ctx['ACCOUNT_ID'],
+                    "contractId": self.contract_id,
+                    "type": 1,
+                    "side": 1 - side,
+                    "size": size,
+                    "limitPrice": tp,
+                    "linkedOrderId": linked_id,
+                }
+                tp_order = self.ctx['api_post'](token, "/api/Order/place", tp_payload)
+                if not tp_order.get("success") or not tp_order.get("orderId"):
+                    logging.warning(f"TP place failed: payload={tp_payload} resp={tp_order}")
+                    # continue without TP
             time.sleep(0.25)
             sl_order = None
             sl_is_trailing = False
             native_trail_ok = True  # try native trailing; fallback handled below
-            if use_trail:
+            if use_trail and (sl is not None):
                 # Place trailing stop using signed ticks: LONG < 0, SHORT > 0
                 cm = self.ctx['contract_map'].get(self.symbol) or {}
                 tick_size = float(cm.get("tickSize") or 0.0)
@@ -728,7 +756,7 @@ class MarketStreamer:
                     sl_order = None
                 else:
                     sl_is_trailing = True
-            if sl_order is None:
+            if sl_order is None and sl is not None:
                 logging.info("Placing SL stop @ %.4f linked to %s", sl, entry_id)
                 sl_payload = {
                     "accountId": self.ctx['ACCOUNT_ID'],
@@ -747,7 +775,11 @@ class MarketStreamer:
                     except Exception:
                         pass
                     return
-            self.ctx['oco_orders'][entry_id] = [tp_order.get("orderId"), sl_order.get("orderId")]
+            # Only track OCO pair when both legs exist
+            tp_id_rec = tp_order.get("orderId") if isinstance(tp_order, dict) else None
+            sl_id_rec = sl_order.get("orderId") if isinstance(sl_order, dict) else None
+            if tp_id_rec and sl_id_rec:
+                self.ctx['oco_orders'][entry_id] = [tp_id_rec, sl_id_rec]
             cm = self.ctx['contract_map'].get(self.symbol) or {}
             self.ctx['active_entries'][entry_id] = {
                 "symbol": self.symbol,
@@ -756,13 +788,24 @@ class MarketStreamer:
                 "size": size,
                 "entry": entry_price,
                 "stop_points": float(stop_points),
-                "tp_id": tp_order.get("orderId"),
-                "sl_id": sl_order.get("orderId"),
+                "tp_id": tp_id_rec,
+                "sl_id": sl_id_rec,
                 "be_done": False,
                 "native_trail": bool(sl_is_trailing),
                 "tickSize": float(cm.get("tickSize") or 0.0),
                 "decimals": int(cm.get("decimalPlaces") or 2),
             }
+            # If TV-mode is enabled, annotate for the TV trailing monitor and seed best high/low
+            if bool(self.ctx.get('TV_TRAILING_ENABLED', False)):
+                info = self.ctx['active_entries'][entry_id]
+                info['tv_trail'] = True
+                if side == 0:
+                    info['best_high'] = float(entry_price)
+                else:
+                    info['best_low'] = float(entry_price)
+                # disable break-even adjustments on this leg
+                info['be_done'] = True
+                self.ctx['active_entries'][entry_id] = info
             logging.info("Auto OCO placed: TP_id=%s SL/TRAIL_id=%s", tp_order.get("orderId"), sl_order.get("orderId"))
             if not tp_order.get("success") or not sl_order.get("success"):
                 logging.warning("Bracket responses: TP=%s SL/TRAIL=%s", tp_order, sl_order)

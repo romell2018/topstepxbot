@@ -217,11 +217,31 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
                 "stopPrice": sl,
                 "linkedOrderId": entry_id,
             })
-        oco_orders[entry_id] = [tp_order.get("orderId"), sl_order.get("orderId")]
+        tp_id = tp_order.get("orderId")
+        sl_id = sl_order.get("orderId")
+        oco_orders[entry_id] = [tp_id, sl_id]
+        # Track in active_entries to allow robust cleanup (e.g., manual flat)
+        try:
+            active_entries[entry_id] = {
+                "symbol": symbol,
+                "contractId": contract_id,
+                "side": int(side),
+                "size": int(size),
+                "entry": float(op) if op is not None else None,
+                "stop_points": abs(float(op) - float(sl)) if (op is not None and sl is not None) else None,
+                "tp_id": tp_id,
+                "sl_id": sl_id,
+                "be_done": False,
+                "native_trail": False,
+                "tickSize": float(tick_size),
+                "decimals": int(decimals),
+            }
+        except Exception:
+            pass
         return jsonify({
             "entryOrderId": entry_id,
-            "takeProfitOrderId": tp_order.get("orderId"),
-            "stopLossOrderId": sl_order.get("orderId"),
+            "takeProfitOrderId": tp_id,
+            "stopLossOrderId": sl_id,
             "contractId": contract_id,
             "tickSize": contract["tickSize"],
             "tickValue": contract["tickValue"],
@@ -399,7 +419,12 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
         ctx['load_contracts']()
         asyncio.create_task(ctx['monitor_oco_orders']())
         asyncio.create_task(ctx['monitor_break_even']())
-        asyncio.create_task(ctx['monitor_synth_trailing']())
+        # Trailing orchestration
+        if bool(ctx.get('TV_TRAILING_ENABLED', False)):
+            asyncio.create_task(ctx['monitor_tv_trailing']())
+        else:
+            asyncio.create_task(ctx['monitor_profit_trail']())
+            asyncio.create_task(ctx['monitor_synth_trailing']())
         asyncio.create_task(ctx['monitor_account_snapshot']())
         # Proactive account-state gate before warmup/stream
         try:
