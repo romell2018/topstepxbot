@@ -414,6 +414,12 @@ def make_monitor_synth_trailing(ctx):
                                     ctx['TRAIL_VARIANT'] = name
                                     break
                         if not resp or (not resp.get("success")):
+                            if bool(ctx.get('FORCE_NATIVE_TRAIL', False)):
+                                logging.warning(
+                                    "Synth trail: native trailing rejected for %s; skipping fixed stop fallback",
+                                    str(entry_id)
+                                )
+                                continue
                             # Fallback to fixed STOP at target price
                             payload = {
                                 "accountId": ctx['ACCOUNT_ID'],
@@ -579,6 +585,12 @@ def make_monitor_profit_trail(ctx):
                                 resp = r
                                 break
                         if not resp or (not resp.get("success")):
+                            if bool(ctx.get('FORCE_NATIVE_TRAIL', False)):
+                                logging.warning(
+                                    "Profit-trail: native trailing rejected for %s; skipping fixed stop fallback",
+                                    str(entry_id)
+                                )
+                                continue
                             # Fallback to a fixed STOP at prior stop level to avoid being unprotected
                             payload = {
                                 "accountId": ctx['ACCOUNT_ID'],
@@ -664,6 +676,15 @@ def make_monitor_tv_trailing(ctx):
                         t_points = float(ctx.get('TV_TRAIL_POINTS_LONG') if side == 0 else ctx.get('TV_TRAIL_POINTS_SHORT') or 0.0)
                         if t_points <= 0:
                             continue
+                        try:
+                            t_off = float(ctx.get('TV_TRAIL_OFFSET_LONG') if side == 0 else ctx.get('TV_TRAIL_OFFSET_SHORT') or 0.0)
+                        except Exception:
+                            t_off = 0.0
+                        if t_off > 0.0:
+                            if side == 0 and best < (entry_px + t_off):
+                                continue
+                            if side == 1 and best > (entry_px - t_off):
+                                continue
                         # Compute target stop based on TV rule; never loosen
                         if side == 0:
                             target = best - t_points
@@ -680,29 +701,78 @@ def make_monitor_tv_trailing(ctx):
                         if not ok:
                             logging.warning(f"TV trail: failed to cancel SL {sl_id} for {entry_id}")
                             continue
-                        payload = {
+                        # Determine trailing ticks based on TV distance
+                        try:
+                            t_ticks = int(max(1, round(abs(float(t_points)) / float(tick_size))))
+                        except Exception:
+                            t_ticks = 1
+                        base = {
                             "accountId": ctx['ACCOUNT_ID'],
                             "contractId": info.get("contractId"),
-                            "type": 4,
+                            "type": 5,
                             "side": 1 - side,
                             "size": size,
-                            "stopPrice": target,
                             "linkedOrderId": entry_id,
                         }
-                        resp = ctx['api_post'](token, "/api/Order/place", payload)
-                        if not resp.get("success"):
-                            logging.warning(f"TV trail: replace SL failed for {entry_id}: {resp}")
+                        attempts = []
+                        try:
+                            t_signed_pos = int(max(1, int(t_ticks)))
+                        except Exception:
+                            t_signed_pos = int(t_ticks)
+                        try:
+                            t_signed_neg = -int(max(1, int(t_ticks)))
+                        except Exception:
+                            t_signed_neg = -int(t_ticks)
+                        attempts.append(("trailticks+", dict(base, trailTicks=int(t_signed_pos))))
+                        attempts.append(("trailticks-", dict(base, trailTicks=int(t_signed_neg))))
+                        attempts.append(("traildistance", dict(base, trailDistance=int(max(1, int(t_ticks))))))
+                        attempts.append(("distance", dict(base, distance=int(max(1, int(t_ticks))))))
+                        attempts.append(("distance+traildistance", dict(base, distance=int(max(1, int(t_ticks))), trailDistance=int(max(1, int(t_ticks))))))
+                        attempts.append(("distanceticks", dict(base, distanceTicks=int(max(1, int(t_ticks))))))
+                        attempts.append(("trailingdistance", dict(base, trailingDistance=int(max(1, int(t_ticks))))))
+                        preferred = str(ctx.get('TRAIL_VARIANT') or '').strip().lower()
+                        if preferred:
+                            attempts.sort(key=lambda x: (x[0] != preferred,))
+                        resp = None
+                        trail_log = ctx.setdefault('LAST_TRAIL_ATTEMPTS', [])
+                        for name, payload in attempts:
+                            resp = ctx['api_post'](token, "/api/Order/place", payload)
+                            try:
+                                rec = {
+                                    'ts': int(time.time()),
+                                    'variant': name,
+                                    'payloadKeys': sorted(list(payload.keys())),
+                                    'trailFields': {k: payload.get(k) for k in ('trailTicks','trailDistance','distance','distanceTicks','trailingDistance','trailPrice','distancePrice','stopPrice') if k in payload},
+                                    'resp': {'success': resp.get('success'), 'orderId': resp.get('orderId'), 'errorCode': resp.get('errorCode'), 'errorMessage': resp.get('errorMessage')},
+                                    'linkedId': entry_id,
+                                }
+                                trail_log.append(rec)
+                                if len(trail_log) > 50:
+                                    del trail_log[:len(trail_log)-50]
+                                ctx['LAST_TRAIL_ATTEMPTS'] = trail_log
+                            except Exception:
+                                pass
+                            if resp.get("success") and resp.get("orderId"):
+                                ctx['TRAIL_VARIANT'] = name
+                                break
+                        if not resp or not resp.get("success"):
+                            logging.warning(f"TV trail: failed to place native trailing stop for {entry_id}: {resp}")
                             continue
                         new_sl_id = resp.get("orderId")
                         info["sl_id"] = new_sl_id
+                        info["native_trail"] = True
                         info["stop_points"] = abs(entry_px - target)
                         ctx['active_entries'][entry_id] = info
                         if entry_id in ctx['oco_orders'] and isinstance(ctx['oco_orders'][entry_id], list) and len(ctx['oco_orders'][entry_id]) == 2:
                             ctx['oco_orders'][entry_id][1] = new_sl_id
-                        logging.info("TV trail moved STOP to %.4f (entry %.4f, best %.4f, points %.4f)", target, entry_px, best, t_points)
+                        logging.info("TV trail switched to native trailing (ticks=%d) target %.4f entry %.4f best %.4f", int(t_ticks), target, entry_px, best)
                     except Exception:
                         continue
             except Exception:
                 pass
-            await asyncio.sleep(0.25)
+            try:
+                sleep_s = float(ctx.get('TV_TRAIL_POLL_SEC', 0.75) or 0.75)
+            except Exception:
+                sleep_s = 0.75
+            await asyncio.sleep(max(0.25, sleep_s))
     return monitor_tv_trailing
