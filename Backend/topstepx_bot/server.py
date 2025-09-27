@@ -231,7 +231,6 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
                 "stop_points": abs(float(op) - float(sl)) if (op is not None and sl is not None) else None,
                 "tp_id": tp_id,
                 "sl_id": sl_id,
-                "be_done": False,
                 "native_trail": False,
                 "tickSize": float(tick_size),
                 "decimals": int(decimals),
@@ -418,13 +417,7 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
         # Load contracts and start monitors
         ctx['load_contracts']()
         asyncio.create_task(ctx['monitor_oco_orders']())
-        asyncio.create_task(ctx['monitor_break_even']())
-        # Trailing orchestration
-        if bool(ctx.get('TV_TRAILING_ENABLED', False)):
-            asyncio.create_task(ctx['monitor_tv_trailing']())
-        else:
-            asyncio.create_task(ctx['monitor_profit_trail']())
-            asyncio.create_task(ctx['monitor_synth_trailing']())
+        asyncio.create_task(ctx['monitor_synth_trailing']())
         asyncio.create_task(ctx['monitor_account_snapshot']())
         # Proactive account-state gate before warmup/stream
         try:

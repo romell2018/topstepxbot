@@ -22,11 +22,8 @@ from topstepx_bot.market import (
 from topstepx_bot.monitors import (
     make_monitor_oco_orders,
     make_monitor_account_snapshot,
-    make_monitor_break_even,
     make_monitor_synth_trailing,
     make_get_open_orders_count,
-    make_monitor_profit_trail,
-    make_monitor_tv_trailing,
 )
 from topstepx_bot.risk import (
     risk_per_point as risk_per_point_module,
@@ -40,6 +37,8 @@ from topstepx_bot.streamer import MarketStreamer as _MarketStreamer
 with open("config.yaml") as f:
     config = yaml.safe_load(f)
 
+
+# Connection- and market-level configuration derived from YAML
 API_URL = config.get("api_base") or config.get("API_URL") or "https://api.topstepx.com"
 AUTH = config.get("auth", {}) or {}
 USERNAME = config.get("username") or AUTH.get("username") or AUTH.get("email") or ""
@@ -57,6 +56,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Global state
+# Shared mutable state the streamer + monitors mutate
 oco_orders: Dict[Any, List[Any]] = {}
 contract_map: Dict[str, Dict[str, Any]] = {}
 bars_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
@@ -69,6 +69,7 @@ streamers: Dict[str, Any] = {}
 
 # Strategy params
 DEBUG = bool(config.get("debug", False))
+# Strategy tuning knobs (mirrors TradingView strategy inputs)
 STRAT = (config.get("strategy") or {})
 EMA_SHORT = int(STRAT.get("emaShort", 9))
 EMA_LONG = int(STRAT.get("emaLong", 21))
@@ -89,9 +90,6 @@ RISK_BUDGET_FRACTION = float(STRAT.get("riskBudgetFraction", 0.0))
 TRADE_COOLDOWN_SEC = int((config.get("risk") or {}).get("trade_cooldown_sec", 10))
 ORDER_SIZE = int((config.get("trade") or {}).get("order_size", 1))
 PAD_TICKS = int(STRAT.get("padTicks", 0))
-BREAK_EVEN_ENABLED = bool(STRAT.get("breakEvenEnabled", True))
-BREAK_EVEN_LONG_FACTOR = float(STRAT.get("breakEvenLongFactor", 1.5))
-BREAK_EVEN_SHORT_FACTOR = float(STRAT.get("breakEvenShortFactor", 1.0))
 TRADE_CFG = (config.get("trade") or {})
 FIXED_TP_POINTS = float(TRADE_CFG.get("tpPoints", 0) or 0)
 FIXED_SL_POINTS = float(TRADE_CFG.get("slPoints", 0) or 0)
@@ -121,31 +119,6 @@ SYNTH_TRAIL_POLL_SEC = float((config.get("runtime") or {}).get("synth_trail_poll
 FORCE_NATIVE_TRAIL = bool(STRAT.get("forceNativeTrailing", False))
 FORCE_FIXED_TRAIL_TICKS = bool(STRAT.get("forceFixedTrailTicks", False))
 
-# Profit-activated trailing config
-PROFIT_TRAIL_ENABLED = bool(STRAT.get("profitTrailEnabled", True))
-TRAIL_POINTS_LONG = float(STRAT.get("trailPointsLong", STRAT.get("trailPoints", 0.0)) or 0.0)
-TRAIL_POINTS_SHORT = float(STRAT.get("trailPointsShort", STRAT.get("trailPoints", 0.0)) or 0.0)
-TRAIL_OFFSET_LONG = float(STRAT.get("trailOffsetLong", STRAT.get("trailOffset", 0.0)) or 0.0)
-TRAIL_OFFSET_SHORT = float(STRAT.get("trailOffsetShort", STRAT.get("trailOffset", 0.0)) or 0.0)
-
-# TradingView-style trailing config (accepts underscore or camelCase variants)
-def _cfg2(name_camel: str, name_us: str, default: float = 0.0) -> float:
-    try:
-        v = STRAT.get(name_camel)
-        if v is None:
-            v = STRAT.get(name_us)
-        return float(v if v is not None else default)
-    except Exception:
-        return float(default)
-
-TV_TRAILING_ENABLED = bool(STRAT.get("tvTrailingEnabled", False))
-TV_TRAIL_POINTS_LONG = _cfg2("trailPointsLong", "trail_points_long", 0.0)
-TV_TRAIL_POINTS_SHORT = _cfg2("trailPointsShort", "trail_points_short", 0.0)
-TV_TRAIL_OFFSET_LONG = _cfg2("trailOffsetLong", "trail_offset_long", 0.0)
-TV_TRAIL_OFFSET_SHORT = _cfg2("trailOffsetShort", "trail_offset_short", 0.0)
-TV_TP_POINTS_LONG = _cfg2("tpPointsLong", "tp_points_long", 0.0)
-TV_TP_POINTS_SHORT = _cfg2("tpPointsShort", "tp_points_short", 0.0)
-
 ATR = _ATR
 
 # Synthetic warmup sizing (after EMA_LONG is defined)
@@ -160,7 +133,7 @@ if SYNTH_WARMUP_MINUTES <= 0:
 MIN_REAL_BARS_BEFORE_TRADING = int(STRAT.get("minRealBarsBeforeTrading", 2) or 0)
 
 
-# API wrappers
+# API wrapper helpers keep Quart routes decoupled from direct SDK calls
 def get_token():
     return _api_get_token(API_URL, USERNAME, API_KEY)
 
@@ -177,7 +150,7 @@ def get_account_info(token):
     return _api_get_account_info(token)
 
 
-# Market helpers
+# Market helpers centralise historical warmup + stream seeding
 def load_contracts():
     return market_load_contracts(get_token, contract_map, config, SYMBOL)
 
@@ -191,6 +164,7 @@ def warmup_bars(symbol: str, contract_id: Any, days: int = 1, unit: int = 2, uni
     if not token:
         logging.warning("Warmup failed: no token")
         return
+    # Align history requests to configured session timezone for indicator correctness
     tzname = config.get("tz") or "America/New_York"
     hours = BOOTSTRAP_HISTORY_HOURS if BOOTSTRAP_HISTORY_HOURS and BOOTSTRAP_HISTORY_HOURS > 0 else None
     return market_warmup_bars(
@@ -216,7 +190,7 @@ def warmup_bars(symbol: str, contract_id: Any, days: int = 1, unit: int = 2, uni
     )
 
 
-# Risk/helpers
+# Risk/helpers provide per-symbol sizing + account guardrails
 def risk_per_point(symbol: str, contract_id: Any) -> float:
     return risk_per_point_module(contract_map, RISK_PER_POINT_CONFIG, symbol, contract_id)
 
@@ -231,6 +205,7 @@ def compute_indicators(df):
 
 
 def run_server():
+    # Compose a dependency container the Quart app + background monitors consume
     ctx: Dict[str, Any] = {
         'get_token': get_token,
         'api_post': api_post,
@@ -288,20 +263,6 @@ def run_server():
         'risk_per_point': risk_per_point,
         'get_risk_dollars': get_risk_dollars,
         'compute_indicators': compute_indicators,
-        # TradingView-style trailing
-        'TV_TRAILING_ENABLED': bool(TV_TRAILING_ENABLED),
-        'TV_TRAIL_POINTS_LONG': float(TV_TRAIL_POINTS_LONG),
-        'TV_TRAIL_POINTS_SHORT': float(TV_TRAIL_POINTS_SHORT),
-        'TV_TRAIL_OFFSET_LONG': float(TV_TRAIL_OFFSET_LONG),
-        'TV_TRAIL_OFFSET_SHORT': float(TV_TRAIL_OFFSET_SHORT),
-        'TV_TP_POINTS_LONG': float(TV_TP_POINTS_LONG),
-        'TV_TP_POINTS_SHORT': float(TV_TP_POINTS_SHORT),
-        # profit-activated trailing settings (in points)
-        'PROFIT_TRAIL_ENABLED': PROFIT_TRAIL_ENABLED,
-        'TRAIL_POINTS_LONG': TRAIL_POINTS_LONG,
-        'TRAIL_POINTS_SHORT': TRAIL_POINTS_SHORT,
-        'TRAIL_OFFSET_LONG': TRAIL_OFFSET_LONG,
-        'TRAIL_OFFSET_SHORT': TRAIL_OFFSET_SHORT,
         # bracket entry support
         'USE_BRACKETS_PAYLOAD': bool((config.get('trade') or {}).get('useBracketsPayload', True)),
         # warmup behavior
@@ -320,17 +281,15 @@ def run_server():
     }
     try:
         logging.info(
-            "Strategy switches | forceCrossUp=%s longOnly=%s nativeTrailOnly=%s tvMode=%s",
-            str(FORCE_CROSS_UP), str(LONG_ONLY), str(bool(STRAT.get('onlyNativeTrailing', False))), str(bool(STRAT.get('tvTrailingEnabled', False)))
+            "Strategy switches | forceCrossUp=%s longOnly=%s nativeTrailOnly=%s",
+            str(FORCE_CROSS_UP), str(LONG_ONLY), str(bool(STRAT.get('onlyNativeTrailing', False)))
         )
     except Exception:
         pass
+    # Instantiate monitor coroutines that manage exits, risk snapshots, and trailing logic
     ctx['monitor_oco_orders'] = make_monitor_oco_orders(ctx)
     ctx['monitor_account_snapshot'] = make_monitor_account_snapshot(ctx)
-    ctx['monitor_break_even'] = make_monitor_break_even(ctx)
     ctx['monitor_synth_trailing'] = make_monitor_synth_trailing(ctx)
-    ctx['monitor_profit_trail'] = make_monitor_profit_trail(ctx)
-    ctx['monitor_tv_trailing'] = make_monitor_tv_trailing(ctx)
     ctx['get_open_orders_count'] = make_get_open_orders_count(ctx)
     ctx['MarketStreamer'] = lambda symbol, contract_id, unit=2, unit_n=1: _MarketStreamer(ctx, symbol, contract_id, unit, unit_n)
     global app

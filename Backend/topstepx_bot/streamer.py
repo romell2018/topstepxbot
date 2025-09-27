@@ -403,20 +403,10 @@ class MarketStreamer:
             "stop_points": float(stop_points),
             "tp_id": None,
             "sl_id": sl_id,
-            "be_done": True,
             "native_trail": bool(sl_id),
             "tickSize": float(cm.get("tickSize") or 0.0),
             "decimals": int(cm.get("decimalPlaces") or 2),
         }
-
-        if bool(self.ctx.get('TV_TRAILING_ENABLED', False)):
-            entry_info['tv_trail'] = True
-            if side == 0:
-                entry_info['best_high'] = float(op)
-            else:
-                entry_info['best_low'] = float(op)
-            # Prevent break-even logic from touching the leg; TV monitor manages movement
-            entry_info['be_done'] = True
 
         # Ensure there's no OCO tracking when we don't create TP legs
         if entry_id in self.ctx['oco_orders']:
