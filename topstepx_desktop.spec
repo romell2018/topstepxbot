@@ -52,7 +52,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='topstepx-desktop',
+    name='DuvenchyBot',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
