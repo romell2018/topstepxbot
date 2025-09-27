@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TopstepX Bot Control</title>
+  <link rel="stylesheet" href="/ui/styles.css" />
+</head>
+<body>
+  <main class="page">
+    <section class="card">
+      <header class="card__header">
+        <h1>TopstepX Bot Control</h1>
+        <p class="subtitle">Monitor your connection and toggle live trading.</p>
+      </header>
+      <div id="connection-status" class="status status--loading">Loading bot state…</div>
+      <div class="grid">
+        <div class="field"><span class="field__label">Username</span><span id="username" class="field__value">—</span></div>
+        <div class="field"><span class="field__label">Account ID</span><span id="account-id" class="field__value">—</span></div>
+        <div class="field"><span class="field__label">Symbol</span><span id="symbol" class="field__value">—</span></div>
+        <div class="field"><span class="field__label">API Key</span><span id="api-key" class="field__value">—</span></div>
+        <div class="field"><span class="field__label">Trading</span><span id="trading-status" class="field__value">—</span></div>
+        <div class="field"><span class="field__label">Open Orders</span><span id="open-orders" class="field__value">—</span></div>
+        <div class="field"><span class="field__label">Balance</span><span id="balance" class="field__value">—</span></div>
+        <div class="field"><span class="field__label">Equity</span><span id="equity" class="field__value">—</span></div>
+        <div class="field"><span class="field__label">Max Loss</span><span id="max-loss" class="field__value">—</span></div>
+        <div class="field"><span class="field__label">Last Price</span><span id="last-price" class="field__value">—</span></div>
+        <div class="field"><span class="field__label">Account Status</span><span id="account-status" class="field__value">—</span></div>
+        <div class="field"><span class="field__label">Updated</span><span id="updated-at" class="field__value">—</span></div>
+      </div>
+      <div class="actions">
+        <button id="toggle-btn" class="btn" disabled>Loading…</button>
+        <button id="refresh-btn" class="btn btn--ghost">Refresh</button>
+      </div>
+      <div id="info-msg" class="info"></div>
+    </section>
+  </main>
+  <script src="/ui/app.js"></script>
+</body>
+</html>

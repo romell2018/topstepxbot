@@ -21,10 +21,17 @@ Reads credentials and account info from config.yaml at project root.
 import argparse
 import logging
 import os
+import sys
 import time
 from typing import Any, Dict, Optional
 
 import yaml
+
+# allow running from examples/ by ensuring Backend package is importable
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if BACKEND_ROOT not in sys.path:
+    sys.path.insert(0, BACKEND_ROOT)
 
 from topstepx_bot.api import get_token as _api_get_token, api_post as _api_post, cancel_order as _cancel_order
 from topstepx_bot.market import load_contracts as _load_contracts
@@ -211,4 +218,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

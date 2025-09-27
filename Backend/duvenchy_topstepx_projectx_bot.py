@@ -1,10 +1,24 @@
-import yaml
+import json
+import os
+import sys
 import urllib3
 import logging
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from quart import Quart
+
+
+# Ensure local backend package is importable when running as a script
+BACKEND_ROOT = Path(__file__).resolve().parent
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+try:
+    import yaml  # type: ignore
+except ImportError:  # pragma: no cover - dependency optional for GUI flow
+    yaml = None
 
 from topstepx_bot.utils import snap_to_tick, fmt_num, iso_utc_z
 from topstepx_bot.indicators import ATR as _ATR, compute_indicators as _compute_indicators
@@ -33,9 +47,49 @@ from topstepx_bot.server import create_app
 from topstepx_bot.streamer import MarketStreamer as _MarketStreamer
 
 
+def _try_parse_config(blob: str) -> Optional[Dict[str, Any]]:
+    if not blob:
+        return None
+    if yaml is not None:
+        try:
+            cfg = yaml.safe_load(blob)
+            if isinstance(cfg, dict):
+                return cfg
+        except Exception:
+            logging.exception("Failed to parse config with yaml; will try JSON")
+    try:
+        cfg = json.loads(blob)
+        if isinstance(cfg, dict):
+            return cfg
+    except Exception:
+        logging.exception("Failed to parse config JSON override")
+    return None
+
+
+def load_config() -> Dict[str, Any]:
+    inline_json = os.environ.get("TOPSTEPX_CONFIG_JSON")
+    cfg = _try_parse_config(inline_json) if inline_json else None
+    if cfg:
+        return cfg
+    inline = os.environ.get("TOPSTEPX_CONFIG")
+    cfg = _try_parse_config(inline) if inline else None
+    if cfg:
+        return cfg
+    cfg_path_env = os.environ.get("TOPSTEPX_CONFIG_PATH")
+    cfg_path = Path(cfg_path_env).expanduser() if cfg_path_env else (BACKEND_ROOT / "config.yaml")
+    if yaml is None:
+        raise RuntimeError(
+            "PyYAML is required to load config.yaml from disk. Install pyyaml or provide TOPSTEPX_CONFIG_JSON."
+        )
+    with cfg_path.open() as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Configuration at {cfg_path} is not a mapping")
+    return data
+
+
 # --- Load config ---
-with open("config.yaml") as f:
-    config = yaml.safe_load(f)
+config = load_config()
 
 
 # Connection- and market-level configuration derived from YAML
@@ -278,6 +332,11 @@ def run_server():
         'AUTO_REENABLE_TRADING_ON_OPEN': True,
         # capability toggle: disable native trailing; use synthetic trailing only
         'NATIVE_TRAIL_SUPPORTED': False,
+        # frontend metadata for the UI
+        'USERNAME': USERNAME,
+        'API_KEY': API_KEY,
+        'FRONTEND_ROOT': (Path(__file__).resolve().parent.parent / "Frontend").resolve(),
+        'FRONTEND_INDEX': 'index.html',
     }
     try:
         logging.info(

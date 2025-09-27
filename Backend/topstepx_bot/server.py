@@ -3,8 +3,9 @@ import logging
 import time
 import threading
 import datetime as dt
+from pathlib import Path
 from typing import Any, Dict
-from quart import Quart, request, jsonify
+from quart import Quart, request, jsonify, send_from_directory
 
 
 def create_app(ctx: Dict[str, Any]) -> Quart:
@@ -29,6 +30,40 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
     DEBUG = ctx.get('DEBUG', False)
     snap_to_tick = ctx['snap_to_tick']
     fmt_num = ctx['fmt_num']
+
+    raw_frontend_root = ctx.get('FRONTEND_ROOT')
+    try:
+        frontend_root = Path(raw_frontend_root).resolve() if raw_frontend_root else Path(__file__).resolve().parents[2] / "Frontend"
+    except Exception:
+        frontend_root = Path(__file__).resolve().parents[2] / "Frontend"
+    frontend_index = str(ctx.get('FRONTEND_INDEX') or 'index.html')
+
+    def mask_secret(secret: Any, visible: int = 4) -> str:
+        if not secret:
+            return ""
+        secret_str = str(secret)
+        if len(secret_str) <= 2:
+            return "*" * len(secret_str)
+        if len(secret_str) <= visible * 2:
+            return secret_str[0] + ("*" * (len(secret_str) - 2)) + secret_str[-1]
+        return f"{secret_str[:visible]}{'*' * (len(secret_str) - (visible * 2))}{secret_str[-visible:]}"
+
+    async def serve_frontend_asset(filename: str):
+        if not frontend_root.exists():
+            return jsonify({"error": "UI assets not found"}), 404
+        try:
+            return await send_from_directory(str(frontend_root), filename)
+        except Exception:
+            return jsonify({"error": "Asset not found"}), 404
+
+    @app.get("/")
+    async def ui_index():
+        return await serve_frontend_asset(frontend_index)
+
+    @app.get("/ui/")
+    async def ui_root():
+        return await serve_frontend_asset(frontend_index)
+
 
     async def place_oco_generic(data, entry_type):
         quantity = int(data.get("quantity", 1))
@@ -388,6 +423,56 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
         cnt = get_open_orders_count()
         return jsonify({"accountId": ACCOUNT_ID, "symbol": SYMBOL, "openOrders": cnt, "active": cnt > 0})
 
+    @app.get("/ui/state")
+    async def ui_state():
+        balance = account_snapshot.get('balance')
+        equity = account_snapshot.get('equity')
+        maximum_loss = None
+        account_status = None
+        account_name = None
+        token_ok = False
+        fetch_error = None
+        try:
+            token = get_token()
+            if token:
+                token_ok = True
+                acct = get_account_info(token) or {}
+                balance = acct.get('balance', balance)
+                equity = acct.get('equity', equity)
+                maximum_loss = acct.get('maximumLoss')
+                account_status = (acct.get('status') or acct.get('state') or acct.get('accountStatus') or acct.get('lifecycleState'))
+                account_name = acct.get('name') or acct.get('accountName') or acct.get('displayName')
+        except Exception as exc:
+            fetch_error = str(exc).split('\n')[0][:160]
+        try:
+            open_orders = get_open_orders_count()
+        except Exception:
+            open_orders = None
+        streamer = streamers.get(SYMBOL)
+        return jsonify({
+            "username": ctx.get('USERNAME') or "",
+            "apiKeyMasked": mask_secret(ctx.get('API_KEY')), 
+            "accountId": ACCOUNT_ID,
+            "accountName": account_name,
+            "symbol": SYMBOL,
+            "tokenValid": bool(token_ok),
+            "tradingDisabled": bool(ctx.get('TRADING_DISABLED')),
+            "tradingDisabledReason": ctx.get('TRADING_DISABLED_REASON'),
+            "openOrders": open_orders,
+            "balance": balance,
+            "equity": equity,
+            "maximumLoss": maximum_loss,
+            "accountStatus": account_status,
+            "connected": bool(streamer),
+            "lastPrice": last_price.get(SYMBOL),
+            "error": fetch_error,
+            "timestamp": int(time.time()),
+        })
+
+    @app.get("/ui/<path:filename>")
+    async def ui_static(filename: str):
+        return await serve_frontend_asset(filename)
+
     @app.get("/diag/status")
     async def diag_status():
         return jsonify({
@@ -411,6 +496,14 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
         ctx['TRADING_DISABLED'] = False
         ctx['TRADING_DISABLED_REASON'] = None
         return jsonify({"ok": True})
+
+    @app.post("/trading/disable")
+    async def trading_disable():
+        data = await request.get_json(silent=True) or {}
+        reason = data.get('reason') or 'manual toggle'
+        ctx['TRADING_DISABLED'] = True
+        ctx['TRADING_DISABLED_REASON'] = reason
+        return jsonify({"ok": True, "reason": reason})
 
     @app.before_serving
     async def startup():
