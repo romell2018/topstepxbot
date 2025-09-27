@@ -92,6 +92,77 @@ def load_config() -> Dict[str, Any]:
 config = load_config()
 
 
+def _detect_config_source_hint() -> str:
+    if os.environ.get("TOPSTEPX_CONFIG_JSON"):
+        return "env TOPSTEPX_CONFIG_JSON"
+    if os.environ.get("TOPSTEPX_CONFIG"):
+        return "env TOPSTEPX_CONFIG"
+    cfg_path_env = os.environ.get("TOPSTEPX_CONFIG_PATH")
+    if cfg_path_env:
+        try:
+            return str(Path(cfg_path_env).expanduser())
+        except Exception:
+            return cfg_path_env
+    return str(BACKEND_ROOT / "config.yaml")
+
+
+CONFIG_SOURCE_HINT = _detect_config_source_hint()
+
+
+def _coerce_literal(value: str) -> Any:
+    txt = value.strip()
+    if not txt:
+        return None
+    lowered = txt.lower()
+    if lowered in {"true", "yes", "on"}:
+        return True
+    if lowered in {"false", "no", "off"}:
+        return False
+    try:
+        if "." in txt or "e" in lowered:
+            return float(txt)
+        return int(txt)
+    except ValueError:
+        pass
+    if (txt.startswith('"') and txt.endswith('"')) or (txt.startswith("'") and txt.endswith("'")):
+        return txt[1:-1]
+    return txt
+
+
+def _load_strategy_defaults_from_file() -> Dict[str, Any]:
+    path = BACKEND_ROOT / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        lines = path.read_text().splitlines()
+    except Exception:
+        return {}
+    defaults: Dict[str, Any] = {}
+    in_strategy = False
+    base_indent = None
+    for raw in lines:
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(stripped)
+        if not in_strategy:
+            if stripped.startswith("strategy:"):
+                in_strategy = True
+                base_indent = indent
+            continue
+        if indent <= (base_indent or 0):
+            break
+        if ":" not in stripped:
+            continue
+        key, val = stripped.split(":", 1)
+        defaults[key.strip()] = _coerce_literal(val)
+    return defaults
+
+
+STRATEGY_FALLBACKS = _load_strategy_defaults_from_file()
+
+
 # Connection- and market-level configuration derived from YAML
 API_URL = config.get("api_base") or config.get("API_URL") or "https://api.topstepx.com"
 AUTH = config.get("auth", {}) or {}
@@ -122,56 +193,87 @@ account_snapshot: Dict[str, Optional[float]] = {"balance": None, "equity": None}
 streamers: Dict[str, Any] = {}
 
 # Strategy params
-DEBUG = bool(config.get("debug", "debug"))
+DEBUG = bool(config.get("debug", False))
 # Strategy tuning knobs (mirrors TradingView strategy inputs)
 STRAT = (config.get("strategy") or {})
-EMA_SHORT = int(STRAT.get("emaShort","emaShort" ))
-EMA_LONG = int(STRAT.get("emaLong", "emaLong"))
-EMA_SOURCE = str(STRAT.get("emaSource", "close")).strip().lower()
-RTH_ONLY = bool(STRAT.get("rthOnly", "rthOnly"))
-USE_VWAP = bool(STRAT.get("vwapEnabled", "vwapEnabled"))
-ATR_LENGTH = int(STRAT.get("atrLength", "atrLength"))
-RISK_PER_TRADE = float(STRAT.get("riskPerTrade", "riskPerTrade"))
-CONTRACT_SIZE_MAX = int(STRAT.get("contractSizeMax", "contractSizeMax"))
+
+
+def _require_strategy_value(*keys):
+    for key in keys:
+        if key in STRAT:
+            value = STRAT.get(key)
+            if value is not None:
+                return value
+        if key in STRATEGY_FALLBACKS:
+            fallback_value = STRATEGY_FALLBACKS.get(key)
+            if fallback_value is not None:
+                STRAT[key] = fallback_value
+                return fallback_value
+    joined = "/".join(keys)
+    raise RuntimeError(
+        "Missing strategy config value for "
+        f"{joined}. Update the strategy block in {CONFIG_SOURCE_HINT} "
+        "(typically Backend/config.yaml) before launching the bot."
+    )
+
+
+EMA_SHORT = int(_require_strategy_value("emaShort"))
+EMA_LONG = int(_require_strategy_value("emaLong"))
+EMA_SOURCE = str(_require_strategy_value("emaSource")).strip().lower()
+RTH_ONLY = bool(_require_strategy_value("rthOnly"))
+USE_VWAP = bool(_require_strategy_value("vwapEnabled"))
+ATR_LENGTH = int(_require_strategy_value("atrLength"))
+RISK_PER_TRADE = float(_require_strategy_value("riskPerTrade"))
+CONTRACT_SIZE_MAX = int(_require_strategy_value("contractSizeMax"))
 INSTR = (config.get("instrument") or {})
 RISK_PER_POINT_CONFIG = float(INSTR.get("riskPerPoint", 0) or 0)
-TRAILING_STOP_ENABLED = bool(STRAT.get("trailingStopEnabled", False))
-LONG_ONLY = bool(STRAT.get("longOnly", True))
-ATR_TRAIL_K_LONG = float(STRAT.get("atrTrailKLong", STRAT.get("atrTrailK", 2.0)))
-ATR_TRAIL_K_SHORT = float(STRAT.get("atrTrailKShort", STRAT.get("atrTrailK", 2.0)))
-SHORT_SIZE_FACTOR = float(STRAT.get("shortSizeFactor", 0.75))
-RISK_BUDGET_FRACTION = float(STRAT.get("riskBudgetFraction", 0.0))
+TRAILING_STOP_ENABLED = bool(_require_strategy_value("trailingStopEnabled"))
+LONG_ONLY = bool(_require_strategy_value("longOnly"))
+ATR_TRAIL_K_LONG = float(_require_strategy_value("atrTrailKLong", "atrTrailK"))
+ATR_TRAIL_K_SHORT = float(_require_strategy_value("atrTrailKShort", "atrTrailK"))
+SHORT_SIZE_FACTOR = float(_require_strategy_value("shortSizeFactor"))
+RISK_BUDGET_FRACTION = float(_require_strategy_value("riskBudgetFraction"))
 TRADE_COOLDOWN_SEC = int((config.get("risk") or {}).get("trade_cooldown_sec", 10))
 ORDER_SIZE = int((config.get("trade") or {}).get("order_size", 1))
-PAD_TICKS = int(STRAT.get("padTicks", 0))
+PAD_TICKS = int(_require_strategy_value("padTicks"))
 TRADE_CFG = (config.get("trade") or {})
 FIXED_TP_POINTS = float(TRADE_CFG.get("tpPoints", 0) or 0)
 FIXED_SL_POINTS = float(TRADE_CFG.get("slPoints", 0) or 0)
 USE_FIXED_TARGETS = bool(TRADE_CFG.get("useFixedTargets", False))
-AUTO_OCO_ENABLED = bool(STRAT.get("autoOCOBrackets", STRAT.get("autoOCOEnabled", False)))
-POSITION_BRACKETS_ENABLED = bool(STRAT.get("positionBrackets", False))
+AUTO_OCO_ENABLED = bool(_require_strategy_value("autoOCOBrackets", "autoOCOEnabled"))
+POSITION_BRACKETS_ENABLED = bool(_require_strategy_value("positionBrackets"))
+REQUIRE_PRICE_ABOVE_EMAS = bool(STRAT.get("requirePriceAboveEMAS"))
+CONFIRM_BARS = int(_require_strategy_value("confirmBars"))
+STRICT_CROSS_ONLY = bool(_require_strategy_value("strictCrossOnly"))
+INTRABAR_CROSS = bool(_require_strategy_value("intrabarCross"))
+TRAIL_TICKS_FIXED = int(_require_strategy_value("trailDistanceTicks"))
+ONLY_NATIVE_TRAILING = bool(STRAT.get("onlyNativeTrailing"))
+
+
 def _to_bool(v) -> bool:
     if isinstance(v, bool):
         return v
     if isinstance(v, (int, float)):
         return bool(v)
     if isinstance(v, str):
-        return str(v).strip().lower() in ("1","true","yes","on","y")
+        return str(v).strip().lower() in ("1", "true", "yes", "on", "y")
     return bool(v)
 
-def _bool_any(d: Dict[str, any], keys, default=False) -> bool:
+
+def _bool_any(d: Dict[str, Any], keys, default=False) -> bool:
     for k in keys:
         if k in d and d.get(k) is not None:
             return _to_bool(d.get(k))
     return bool(default)
 
+
 # Accept multiple aliases for this switch so config can use crossup/crossUp/forceCrossUp
 FORCE_CROSS_UP = _bool_any(STRAT, ["forceCrossUp", "crossUp", "crossup", "force_cross_up"], False)
-SYNTH_TRAILING_ENABLED = bool(STRAT.get("syntheticTrailingEnabled", True))
-SYNTH_TRAIL_MIN_TICKS = int(STRAT.get("syntheticTrailMinTicks", 1))
+SYNTH_TRAILING_ENABLED = bool(_require_strategy_value("syntheticTrailingEnabled"))
+SYNTH_TRAIL_MIN_TICKS = int(_require_strategy_value("syntheticTrailMinTicks"))
 SYNTH_TRAIL_POLL_SEC = float((config.get("runtime") or {}).get("synth_trail_poll_sec", 0.5))
-FORCE_NATIVE_TRAIL = bool(STRAT.get("forceNativeTrailing", False))
-FORCE_FIXED_TRAIL_TICKS = bool(STRAT.get("forceFixedTrailTicks", False))
+FORCE_NATIVE_TRAIL = bool(_require_strategy_value("forceNativeTrailing"))
+FORCE_FIXED_TRAIL_TICKS = bool(_require_strategy_value("forceFixedTrailTicks"))
 
 ATR = _ATR
 
@@ -184,7 +286,8 @@ if SYNTH_WARMUP_MINUTES <= 0:
         SYNTH_WARMUP_MINUTES = int(EMA_LONG)
 
 # Optional guard: require N real finalized bars before trading
-MIN_REAL_BARS_BEFORE_TRADING = int(STRAT.get("minRealBarsBeforeTrading", 2) or 0)
+_min_real_bars = STRAT.get("minRealBarsBeforeTrading")
+MIN_REAL_BARS_BEFORE_TRADING = int(_min_real_bars) if _min_real_bars is not None else 0
 
 
 # API wrapper helpers keep Quart routes decoupled from direct SDK calls
@@ -286,11 +389,13 @@ def run_server():
         'seed_streamer_from_warmup': seed_streamer_from_warmup,
         'EMA_SHORT': EMA_SHORT,
         'EMA_LONG': EMA_LONG,
+        'EMA_SOURCE': EMA_SOURCE,
+        'RTH_ONLY': RTH_ONLY,
         'USE_VWAP': USE_VWAP,
-        'REQUIRE_PRICE_ABOVE_EMAS': bool(STRAT.get("requirePriceAboveEMAS", False)),
-        'CONFIRM_BARS': int(STRAT.get("confirmBars", 0)),
-        'STRICT_CROSS_ONLY': bool(STRAT.get("strictCrossOnly", False)),
-        'INTRABAR_CROSS': bool(STRAT.get("intrabarCross", False)),
+        'REQUIRE_PRICE_ABOVE_EMAS': REQUIRE_PRICE_ABOVE_EMAS,
+        'CONFIRM_BARS': CONFIRM_BARS,
+        'STRICT_CROSS_ONLY': STRICT_CROSS_ONLY,
+        'INTRABAR_CROSS': INTRABAR_CROSS,
         'TRADE_COOLDOWN_SEC': TRADE_COOLDOWN_SEC,
         'TRAILING_STOP_ENABLED': TRAILING_STOP_ENABLED,
         'AUTO_OCO_ENABLED': AUTO_OCO_ENABLED,
@@ -301,7 +406,7 @@ def run_server():
         'SYNTH_TRAIL_POLL_SEC': max(0.25, float(SYNTH_TRAIL_POLL_SEC)),
         'FORCE_NATIVE_TRAIL': FORCE_NATIVE_TRAIL,
         # fixed native trailing distance in ticks (type 5 orders)
-        'TRAIL_TICKS_FIXED': int(STRAT.get('trailDistanceTicks', 5)),
+        'TRAIL_TICKS_FIXED': TRAIL_TICKS_FIXED,
         'FORCE_FIXED_TRAIL_TICKS': bool(FORCE_FIXED_TRAIL_TICKS),
         'PAD_TICKS': PAD_TICKS,
         'FIXED_TP_POINTS': FIXED_TP_POINTS,
@@ -341,7 +446,7 @@ def run_server():
     try:
         logging.info(
             "Strategy switches | forceCrossUp=%s longOnly=%s nativeTrailOnly=%s",
-            str(FORCE_CROSS_UP), str(LONG_ONLY), str(bool(STRAT.get('onlyNativeTrailing', False)))
+            str(FORCE_CROSS_UP), str(LONG_ONLY), str(ONLY_NATIVE_TRAILING)
         )
     except Exception:
         pass
