@@ -255,6 +255,23 @@ def make_monitor_synth_trailing(ctx):
                         if atr_val is None:
                             continue
                         k = ctx['ATR_TRAIL_K_LONG'] if side == 0 else ctx['ATR_TRAIL_K_SHORT']
+                        # Optional TradingView-like activation offset: start trailing only after price moves favorably by offset * ATR
+                        try:
+                            off_k = float(ctx.get('TRAIL_OFFSET_K_LONG') if side == 0 else ctx.get('TRAIL_OFFSET_K_SHORT'))
+                        except Exception:
+                            off_k = 0.0
+                        if off_k and off_k > 0:
+                            try:
+                                fav_move = (lp - entry_px) if side == 0 else (entry_px - lp)
+                                activated = bool(info.get('trail_activated'))
+                                if (not activated) and (fav_move < float(atr_val) * float(off_k)):
+                                    # Not yet activated; wait until price moves enough in our favor
+                                    continue
+                                if not activated:
+                                    info['trail_activated'] = True
+                                    ctx['active_entries'][entry_id] = info
+                            except Exception:
+                                pass
                         trail_points = float(atr_val) * float(k)
                         # snap and compute candidate new SL
                         tick_size = float(info.get("tickSize") or 0.0)
@@ -395,6 +412,3 @@ def make_monitor_synth_trailing(ctx):
                 pass
             await asyncio.sleep(float(ctx.get('SYNTH_TRAIL_POLL_SEC', 0.5) or 0.5))
     return monitor_synth_trailing
-
-
-

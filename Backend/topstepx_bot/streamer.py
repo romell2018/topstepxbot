@@ -307,18 +307,120 @@ class MarketStreamer:
             return
 
         if not bool(self.ctx.get('TRAILING_STOP_ENABLED', True)):
-            logging.warning("Trailing stop disabled; skipping auto-entry")
-            return
+            # If synthetic trailing is enabled, place entry + fixed TP/SL and let the monitor trail the stop.
+            if bool(self.ctx.get('SYNTH_TRAILING_ENABLED', False)):
+                cm = self.ctx['contract_map'].get(self.symbol) or {}
+                tick_size = float(cm.get("tickSize") or 0.0)
+                decimals = int(cm.get("decimalPlaces") or 2)
+
+                # Pine-like stop distances for initial SL
+                stop_points = float(abs(self.ctx.get('ATR_TRAIL_K_LONG', 1.5) * atr_val)) if side == 0 else float(abs(self.ctx.get('ATR_TRAIL_K_SHORT', 1.0) * atr_val))
+                rp = self.ctx['risk_per_point'](self.symbol, self.contract_id)
+                risk_dollars = self.ctx['get_risk_dollars']()
+                try:
+                    base_contracts = int(max(0, int(risk_dollars / max(1e-6, stop_points * rp))))
+                except Exception:
+                    base_contracts = 0
+                if side == 0:
+                    size = min(self.ctx['CONTRACT_SIZE_MAX'], base_contracts)
+                else:
+                    size_long = min(self.ctx['CONTRACT_SIZE_MAX'], base_contracts)
+                    size = min(int(max(0, int(size_long * self.ctx['SHORT_SIZE_FACTOR']))), self.ctx['CONTRACT_SIZE_MAX'])
+                if size < 1:
+                    logging.info("Skip auto-entry (synth): size < 1 | stop_pts=%.4f $/pt=%.4f risk=%.2f", stop_points, rp, risk_dollars)
+                    return
+                entry_payload = {
+                    "accountId": self.ctx['ACCOUNT_ID'],
+                    "contractId": self.contract_id,
+                    "type": 2,
+                    "side": side,
+                    "size": size,
+                    "customTag": self._unique_tag("ema_cross_synth"),
+                }
+                entry = self.ctx['api_post'](token, "/api/Order/place", entry_payload)
+                if not entry.get("success") or not entry.get("orderId"):
+                    logging.error("Auto entry (synth) failed: %s", entry)
+                    return
+                entry_id = entry.get("orderId")
+                # Compute Pine-matching TP distances
+                if side == 0:
+                    tp_points = float(stop_points) * 3.0
+                    sl_px = float(op) - float(stop_points)
+                    tp_px = float(op) + float(tp_points)
+                else:
+                    tp_points = float(stop_points) * 2.0
+                    sl_px = float(op) + float(stop_points)
+                    tp_px = float(op) - float(tp_points)
+                if tick_size and tick_size > 0:
+                    sl_px = self.ctx['snap_to_tick'](sl_px, tick_size, decimals)
+                    tp_px = self.ctx['snap_to_tick'](tp_px, tick_size, decimals)
+                # Place TP then SL as OCO
+                tp_order = self.ctx['api_post'](token, "/api/Order/place", {
+                    "accountId": self.ctx['ACCOUNT_ID'],
+                    "contractId": self.contract_id,
+                    "type": 1,
+                    "side": 1 - side,
+                    "size": size,
+                    "limitPrice": tp_px,
+                    "linkedOrderId": entry_id,
+                })
+                sl_order = self.ctx['api_post'](token, "/api/Order/place", {
+                    "accountId": self.ctx['ACCOUNT_ID'],
+                    "contractId": self.contract_id,
+                    "type": 4,
+                    "side": 1 - side,
+                    "size": size,
+                    "stopPrice": sl_px,
+                    "linkedOrderId": entry_id,
+                })
+                tp_id = tp_order.get("orderId") if tp_order.get("success") else None
+                sl_id = sl_order.get("orderId") if sl_order.get("success") else None
+                if entry_id and (tp_id or sl_id):
+                    try:
+                        self.ctx['oco_orders'][entry_id] = [tp_id, sl_id]
+                    except Exception:
+                        pass
+                # Active entry so trailing monitor can take over
+                entry_info = {
+                    "symbol": self.symbol,
+                    "contractId": self.contract_id,
+                    "side": side,
+                    "size": size,
+                    "entry": float(op),
+                    "stop_points": float(stop_points),
+                    "tp_id": tp_id,
+                    "sl_id": sl_id,
+                    "native_trail": False,
+                    "tickSize": float(tick_size),
+                    "decimals": int(decimals),
+                }
+                self.ctx['active_entries'][entry_id] = entry_info
+                logging.info("Auto-entry (synth) placed: id=%s size=%d side=%s SL=%.4f TP=%.4f", str(entry_id), int(size), ("BUY" if side==0 else "SELL"), sl_px, tp_px)
+                return
+            else:
+                logging.warning("Trailing stop disabled and synthetic trailing off; skipping auto-entry")
+                return
 
         cm = self.ctx['contract_map'].get(self.symbol) or {}
         tick_size = float(cm.get("tickSize") or 0.0)
         decimals = int(cm.get("decimalPlaces") or 2)
 
+        # Determine trailing distance (ticks) without forcing a 5-tick default
+        trail_ticks_cfg = None
         try:
-            trail_ticks_cfg = int(self.ctx.get('TRAIL_TICKS_FIXED', 5) or 5)
+            cfg_ticks = self.ctx.get('TRAIL_TICKS_FIXED')
+            if cfg_ticks is not None:
+                trail_ticks_cfg = int(max(1, int(cfg_ticks)))
         except Exception:
-            trail_ticks_cfg = 5
-        trail_ticks_cfg = int(max(1, trail_ticks_cfg))
+            trail_ticks_cfg = None
+        if trail_ticks_cfg is None and tick_size and tick_size > 0 and atr_val is not None:
+            try:
+                k = float(self.ctx.get('ATR_TRAIL_K_LONG', 1.5)) if side == 0 else float(self.ctx.get('ATR_TRAIL_K_SHORT', 1.0))
+                trail_ticks_cfg = int(max(1, round((float(atr_val) * k) / float(tick_size))))
+            except Exception:
+                trail_ticks_cfg = None
+        if trail_ticks_cfg is None:
+            trail_ticks_cfg = 1
 
         # Convert ticks to price distance for sizing and logging
         if tick_size and tick_size > 0:

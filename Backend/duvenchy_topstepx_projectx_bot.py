@@ -301,7 +301,8 @@ def run_server():
         'SYNTH_TRAIL_POLL_SEC': max(0.25, float(SYNTH_TRAIL_POLL_SEC)),
         'FORCE_NATIVE_TRAIL': FORCE_NATIVE_TRAIL,
         # fixed native trailing distance in ticks (type 5 orders)
-        'TRAIL_TICKS_FIXED': int(STRAT.get('trailDistanceTicks', 5)),
+        # Allow dynamic trailing distance (ATR based) unless explicitly provided in config
+        'TRAIL_TICKS_FIXED': (int(STRAT.get('trailDistanceTicks')) if (STRAT.get('trailDistanceTicks') not in (None, '', False)) else None),
         'FORCE_FIXED_TRAIL_TICKS': bool(FORCE_FIXED_TRAIL_TICKS),
         'PAD_TICKS': PAD_TICKS,
         'FIXED_TP_POINTS': FIXED_TP_POINTS,
@@ -312,6 +313,10 @@ def run_server():
         'LONG_ONLY': LONG_ONLY,
         'ATR_TRAIL_K_LONG': ATR_TRAIL_K_LONG,
         'ATR_TRAIL_K_SHORT': ATR_TRAIL_K_SHORT,
+        # Activation offsets for trailing (TradingView-like): start trailing only after price moves
+        # favorably by offset_k * ATR. Default to 0.5 if specified in config.
+        'TRAIL_OFFSET_K_LONG': float(STRAT.get('atrTrailOffsetKLong', STRAT.get('atrTrailOffsetK', 0.0))),
+        'TRAIL_OFFSET_K_SHORT': float(STRAT.get('atrTrailOffsetKShort', STRAT.get('atrTrailOffsetK', 0.0))),
         'ATR_LENGTH': ATR_LENGTH,
         'MARKET_HUB': MARKET_HUB,
         'risk_per_point': risk_per_point,

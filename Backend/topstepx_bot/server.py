@@ -160,10 +160,35 @@ def create_app(ctx: Dict[str, Any]) -> Quart:
         sl_is_trailing = False
         if use_trail:
             # Try native trailing stop (type=5) using several variants
-            try:
-                trail_ticks = int(max(1, int(trail_ticks_req if trail_ticks_req is not None else int(ctx.get('TRAIL_TICKS_FIXED', 5)))) )
-            except Exception:
-                trail_ticks = 5
+            # Trail distance priority:
+            # 1) explicit request payload trailTicks
+            # 2) ATR-based dynamic ticks (ATR * K / tick_size)
+            # 3) explicit config trailDistanceTicks if provided
+            # 4) minimal 1 tick
+            trail_ticks = None
+            if trail_ticks_req is not None:
+                try:
+                    trail_ticks = int(max(1, int(trail_ticks_req)))
+                except Exception:
+                    trail_ticks = None
+            if trail_ticks is None:
+                try:
+                    st = (ctx.get('indicator_state') or {}).get(symbol) or {}
+                    atr_val = float(st.get('atr')) if st.get('atr') is not None else None
+                    if atr_val is not None and tick_size and float(tick_size) > 0:
+                        k = float(ctx.get('ATR_TRAIL_K_LONG', 1.5)) if side == 0 else float(ctx.get('ATR_TRAIL_K_SHORT', 1.0))
+                        trail_ticks = int(max(1, round((atr_val * k) / float(tick_size))))
+                except Exception:
+                    trail_ticks = None
+            if trail_ticks is None:
+                try:
+                    cfg_ticks = ctx.get('TRAIL_TICKS_FIXED')
+                    if cfg_ticks is not None:
+                        trail_ticks = int(max(1, int(cfg_ticks)))
+                except Exception:
+                    trail_ticks = None
+            if trail_ticks is None:
+                trail_ticks = 1
             stop_side = 1 - side
             # compute absolute start price when possible
             stop_init = None
