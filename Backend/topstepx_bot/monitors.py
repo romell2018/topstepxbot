@@ -418,12 +418,13 @@ def make_monitor_synth_trailing(ctx):
                                 t_ticks = int(max(1, int(t_ticks_cfg)))
                                 # When forcing fixed ticks, ignore ATR distance for anchoring
                                 trail_points_f = None
-                            # Anchor price using ticks-based or ATR-based offset
+                            # Anchor the starting stop to CURRENT PRICE, not entry, per user preference
+                            # Long: place stop below current price; Short: place stop above current price
                             if trail_points_f is not None and (not force_fixed):
-                                stop_init = float(entry_px - trail_points_f) if side == 0 else float(entry_px + trail_points_f)
+                                stop_init = float(lp - trail_points_f) if side == 0 else float(lp + trail_points_f)
                             else:
                                 offset_points = float(t_ticks) * float(tick_size)
-                                stop_init = float(entry_px - offset_points) if side == 0 else float(entry_px + offset_points)
+                                stop_init = float(lp - offset_points) if side == 0 else float(lp + offset_points)
                             stop_init = ctx['snap_to_tick'](stop_init, float(tick_size), int(decimals)) if (tick_size and decimals is not None) else stop_init
                             base = {
                                 "accountId": ctx['ACCOUNT_ID'],
