@@ -422,7 +422,8 @@ def run_strategy_server():
     # Shared state
     oco_orders: Dict[Any, List[Any]] = {}
     contract_map: Dict[str, Dict[str, Any]] = {}
-    bars_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    bars_by_symbol: Dict[
+        str, List[Dict[str, Any]]] = {}
     indicator_state: Dict[str, Dict[str, Optional[float]]] = {}
     last_price: Dict[str, float] = {}
     _bars_lock = threading.Lock()
