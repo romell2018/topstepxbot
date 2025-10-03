@@ -2,6 +2,7 @@ import requests
 import logging
 import time
 import threading
+import os
 
 
 # Simple in-process token cache with throttle/backoff to avoid 429 storms
@@ -38,7 +39,7 @@ def get_token(api_url: str, username: str, api_key: str):
             json={"userName": username, "apiKey": api_key},
             headers={"Content-Type": "application/json"},
             timeout=10,
-            verify=False,
+            verify=_tls_verify_param(),
         )
         try:
             res.raise_for_status()
@@ -90,7 +91,7 @@ def api_post(api_url: str, token: str, endpoint: str, payload: dict):
                 "x-app-type": "px-desktop",
                 "x-app-version": "1.21.1",
             },
-            verify=False,
+            verify=_tls_verify_param(),
         )
         res.raise_for_status()
         return res.json()
@@ -105,7 +106,7 @@ def cancel_order(api_url: str, token: str, account_id, order_id):
             f"{api_url}/api/Order/cancel",
             json={"accountId": account_id, "orderId": order_id},
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            verify=False,
+            verify=_tls_verify_param(),
         )
         res.raise_for_status()
         return res.json().get("success", False)
@@ -125,7 +126,7 @@ def get_account_info(token: str):
                 "x-app-type": "px-desktop",
                 "x-app-version": "1.21.1",
             },
-            verify=False,
+            verify=_tls_verify_param(),
         )
         res.raise_for_status()
         accounts = res.json()
@@ -136,3 +137,17 @@ def get_account_info(token: str):
     except Exception as e:
         logging.error(f"Account info fetch error: {e}")
         return None
+def _tls_verify_param():
+    """Return the 'verify' parameter for requests:
+    - If TOPSTEPX_CA_BUNDLE/REQUESTS_CA_BUNDLE/SSL_CERT_FILE is set, return that path
+    - Else if TOPSTEPX_TLS_VERIFY is set, coerce to boolean
+    - Else default to True (verify TLS)
+    """
+    for key in ("TOPSTEPX_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        p = os.environ.get(key)
+        if p:
+            return p
+    v = os.environ.get("TOPSTEPX_TLS_VERIFY")
+    if v is not None:
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    return True

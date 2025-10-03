@@ -249,22 +249,102 @@ def make_monitor_synth_trailing(ctx):
                         lp = ctx['last_price'].get(symbol)
                         if lp is None:
                             continue
+                        # Persist initial stop distance for BE/target math
+                        try:
+                            if (info.get('init_stop_points') is None) and (info.get('stop_points') is not None):
+                                info['init_stop_points'] = float(info.get('stop_points'))
+                                ctx['active_entries'][entry_id] = info
+                        except Exception:
+                            pass
                         # compute trailing distance from current ATR and multipliers
                         st = ctx['indicator_state'].get(symbol) or {}
                         atr_val = st.get('atr')
                         if atr_val is None:
                             continue
                         k = ctx['ATR_TRAIL_K_LONG'] if side == 0 else ctx['ATR_TRAIL_K_SHORT']
-                        # Optional TradingView-like activation offset: start trailing only after price moves favorably by offset * ATR
+                        # Break-even stop: when price reaches 50% of target profit, move SL to entry (with optional pad)
+                        try:
+                            init_stop_pts = float(info.get('init_stop_points')) if info.get('init_stop_points') is not None else None
+                            if init_stop_pts is not None and init_stop_pts > 0 and not bool(info.get('breakeven_applied')):
+                                # Pine targets: LONG TP = 3x stop distance; SHORT TP = 2x stop distance
+                                target_pts = float(init_stop_pts) * (3.0 if side == 0 else 2.0)
+                                half_tp = 0.5 * float(target_pts)
+                                fav_move = (lp - entry_px) if side == 0 else (entry_px - lp)
+                                if fav_move >= half_tp:
+                                    tick_size = float(info.get("tickSize") or 0.0)
+                                    decimals = int(info.get("decimals") or 2)
+                                    pad_ticks = int(ctx.get('PAD_TICKS', 0) or 0)
+                                    be_px = entry_px
+                                    if tick_size and pad_ticks:
+                                        if side == 0:
+                                            be_px = entry_px + (abs(pad_ticks) * tick_size)
+                                        else:
+                                            be_px = entry_px - (abs(pad_ticks) * tick_size)
+                                    try:
+                                        if tick_size and tick_size > 0:
+                                            be_px = ctx['snap_to_tick'](be_px, float(tick_size), int(decimals))
+                                    except Exception:
+                                        pass
+                                    ok = ctx['cancel_order'](token, ctx['ACCOUNT_ID'], sl_id)
+                                    if not ok:
+                                        logging.warning(f"Synth trail (BE): failed to cancel SL {sl_id} for {entry_id}")
+                                    payload = {
+                                        "accountId": ctx['ACCOUNT_ID'],
+                                        "contractId": info.get("contractId"),
+                                        "type": 4,
+                                        "side": 1 - side,
+                                        "size": size,
+                                        "stopPrice": be_px,
+                                        "linkedOrderId": entry_id,
+                                    }
+                                    resp = ctx['api_post'](token, "/api/Order/place", payload)
+                                    if not resp.get("success"):
+                                        logging.warning(f"Synth trail (BE): place SL@entry failed for {entry_id}: {resp}")
+                                        # continue trailing without BE if venue rejects
+                                    else:
+                                        new_sl_id = resp.get("orderId")
+                                        info["sl_id"] = new_sl_id
+                                        info["breakeven_applied"] = True
+                                        info["stop_points"] = abs(entry_px - be_px)
+                                        ctx['active_entries'][entry_id] = info
+                                        if entry_id in ctx['oco_orders'] and isinstance(ctx['oco_orders'][entry_id], list) and len(ctx['oco_orders'][entry_id]) == 2:
+                                            ctx['oco_orders'][entry_id][1] = new_sl_id
+                                        logging.info("Synth trail: moved STOP to breakeven %.4f (entry %.4f)", be_px, entry_px)
+                                        # After BE applied, continue loop to next entry this tick
+                                        continue
+                        except Exception:
+                            pass
+                        # Optional activation offset:
+                        # 1) Prefer fixed ticks (TRAIL_OFFSET_TICKS_*), converted via tickSize
+                        # 2) Fallback to ATR multiple (TRAIL_OFFSET_K_*) if provided
                         try:
                             off_k = float(ctx.get('TRAIL_OFFSET_K_LONG') if side == 0 else ctx.get('TRAIL_OFFSET_K_SHORT'))
                         except Exception:
                             off_k = 0.0
-                        if off_k and off_k > 0:
+                        try:
+                            off_ticks = ctx.get('TRAIL_OFFSET_TICKS_LONG') if side == 0 else ctx.get('TRAIL_OFFSET_TICKS_SHORT')
+                            off_ticks = int(off_ticks) if off_ticks not in (None, '', False) else None
+                        except Exception:
+                            off_ticks = None
+                        # Compute required favorable move in price points
+                        offset_pts = None
+                        try:
+                            if off_ticks is not None and off_ticks > 0:
+                                tsize = float(info.get('tickSize') or 0.0)
+                                if tsize and tsize > 0:
+                                    offset_pts = float(abs(int(off_ticks))) * float(tsize)
+                        except Exception:
+                            offset_pts = None
+                        if offset_pts is None and off_k and off_k > 0 and atr_val is not None:
+                            try:
+                                offset_pts = float(atr_val) * float(off_k)
+                            except Exception:
+                                offset_pts = None
+                        if offset_pts is not None and offset_pts > 0:
                             try:
                                 fav_move = (lp - entry_px) if side == 0 else (entry_px - lp)
                                 activated = bool(info.get('trail_activated'))
-                                if (not activated) and (fav_move < float(atr_val) * float(off_k)):
+                                if (not activated) and (fav_move < offset_pts):
                                     # Not yet activated; wait until price moves enough in our favor
                                     continue
                                 if not activated:
@@ -305,15 +385,45 @@ def make_monitor_synth_trailing(ctx):
                             continue
                         # Prefer replacing with a native trailing stop (type=5) when trailing is enabled; otherwise fallback to fixed stop
                         use_native_trail = bool(ctx.get('TRAILING_STOP_ENABLED', True))
+                        # Optional gating: require breakeven to be applied before switching to native trailing
+                        try:
+                            if bool(ctx.get('REQUIRE_BEFORE_NATIVE_TRAIL')) and not bool(info.get('breakeven_applied')):
+                                use_native_trail = False
+                        except Exception:
+                            pass
                         resp = None
                         if use_native_trail and (tick_size and tick_size > 0):
-                            # Try multiple native trailing variants, including price-based trailPrice + stopPrice
+                            # Try multiple native trailing variants
+                            # Determine whether to force fixed tick distance
                             try:
-                                t_ticks = int(max(1, int(ctx.get('TRAIL_TICKS_FIXED', 5))))
+                                force_fixed = bool(ctx.get('FORCE_FIXED_TRAIL_TICKS'))
                             except Exception:
-                                t_ticks = 5
-                            offset_points = float(t_ticks) * float(tick_size)
-                            stop_init = float(entry_px - offset_points) if side == 0 else float(entry_px + offset_points)
+                                force_fixed = False
+                            # Compute ATR-based trail distance in points (may be ignored when force_fixed)
+                            try:
+                                trail_points_f = float(trail_points)
+                            except Exception:
+                                trail_points_f = None
+                            # Resolve tick distance
+                            try:
+                                t_ticks_cfg = int(max(1, int(ctx.get('TRAIL_TICKS_FIXED', 5))))
+                            except Exception:
+                                t_ticks_cfg = 5
+                            if (not force_fixed) and trail_points_f is not None and tick_size and tick_size > 0:
+                                try:
+                                    t_ticks = int(max(1, round(abs(trail_points_f) / float(tick_size))))
+                                except Exception:
+                                    t_ticks = int(max(1, int(t_ticks_cfg)))
+                            else:
+                                t_ticks = int(max(1, int(t_ticks_cfg)))
+                                # When forcing fixed ticks, ignore ATR distance for anchoring
+                                trail_points_f = None
+                            # Anchor price using ticks-based or ATR-based offset
+                            if trail_points_f is not None and (not force_fixed):
+                                stop_init = float(entry_px - trail_points_f) if side == 0 else float(entry_px + trail_points_f)
+                            else:
+                                offset_points = float(t_ticks) * float(tick_size)
+                                stop_init = float(entry_px - offset_points) if side == 0 else float(entry_px + offset_points)
                             stop_init = ctx['snap_to_tick'](stop_init, float(tick_size), int(decimals)) if (tick_size and decimals is not None) else stop_init
                             base = {
                                 "accountId": ctx['ACCOUNT_ID'],
@@ -324,7 +434,8 @@ def make_monitor_synth_trailing(ctx):
                                 "linkedOrderId": entry_id,
                             }
                             resp = None
-                            preferred = str(ctx.get('TRAIL_VARIANT') or '').strip().lower()
+                            preferred_cfg = str(ctx.get('TRAIL_VARIANT') or '').strip().lower()
+                            preferred = 'distanceticks' if force_fixed else preferred_cfg
                             attempts = []
                             # 1) trailTicks signed
                             try:
@@ -335,9 +446,15 @@ def make_monitor_synth_trailing(ctx):
                             # Venue expects absolute start price. Try distancePrice then trailPrice.
                             attempts.append(("distanceprice", dict(base, distancePrice=float(stop_init))))
                             attempts.append(("trailprice", dict(base, trailPrice=float(stop_init))))
-                            attempts.append(("traildistance", dict(base, trailDistance=int(t_ticks))))
-                            attempts.append(("distance", dict(base, distance=int(t_ticks))))
-                            attempts.append(("distance+traildistance", dict(base, distance=int(t_ticks), trailDistance=int(t_ticks))))
+                            # Prefer price-distance fields based on ATR points if available
+                            if trail_points_f is not None:
+                                attempts.append(("traildistance", dict(base, trailDistance=float(trail_points_f))))
+                                attempts.append(("distance", dict(base, distance=float(trail_points_f))))
+                                attempts.append(("distance+traildistance", dict(base, distance=float(trail_points_f), trailDistance=float(trail_points_f))))
+                            else:
+                                attempts.append(("traildistance", dict(base, trailDistance=int(t_ticks))))
+                                attempts.append(("distance", dict(base, distance=int(t_ticks))))
+                                attempts.append(("distance+traildistance", dict(base, distance=int(t_ticks), trailDistance=int(t_ticks))))
                             attempts.append(("distanceticks", dict(base, distanceTicks=int(t_ticks))))
                             attempts.append(("trailingdistance", dict(base, trailingDistance=int(t_ticks))))
                             if preferred:
@@ -362,7 +479,9 @@ def make_monitor_synth_trailing(ctx):
                                 except Exception:
                                     pass
                                 if resp.get("success") and resp.get("orderId"):
-                                    ctx['TRAIL_VARIANT'] = name
+                                    # Remember working variant only if not forcing fixed ticks
+                                    if not force_fixed:
+                                        ctx['TRAIL_VARIANT'] = name
                                     break
                         if not resp or (not resp.get("success")):
                             if bool(ctx.get('FORCE_NATIVE_TRAIL', False)):
@@ -398,14 +517,25 @@ def make_monitor_synth_trailing(ctx):
                             new_sl_id = resp.get("orderId")
                             info["sl_id"] = new_sl_id
                             info["native_trail"] = True
-                            # store distance in points for reference
+                            # store distance in points for reference (ATR-based) and effective ticks used
+                            try:
+                                eff_ticks = int(t_ticks)
+                            except Exception:
+                                eff_ticks = None
                             info["stop_points"] = float(trail_points)
+                            if eff_ticks is not None:
+                                info["trail_ticks"] = int(eff_ticks)
                             ctx['active_entries'][entry_id] = info
                             # keep OCO map in sync if present
                             if entry_id in ctx['oco_orders'] and isinstance(ctx['oco_orders'][entry_id], list) and len(ctx['oco_orders'][entry_id]) == 2:
                                 ctx['oco_orders'][entry_id][1] = new_sl_id
-                            logging.info("Synth trail switched to TRAILING stop (ticks=%s) for entry %s",
-                                         (str(int(max(1, round(abs(trail_points) / tick_size)))) if (tick_size and tick_size > 0) else 'N/A'), str(entry_id))
+                            # Log the effective ticks we asked the venue to use
+                            try:
+                                to_log_ticks = eff_ticks if eff_ticks is not None else (int(max(1, round(abs(trail_points) / tick_size))) if (tick_size and tick_size > 0) else 'N/A')
+                            except Exception:
+                                to_log_ticks = 'N/A'
+                            logging.info("Synth trail switched to TRAILING stop (ticks=%s, variant=%s) for entry %s",
+                                         str(to_log_ticks), str(ctx.get('TRAIL_VARIANT') or '?'), str(entry_id))
                     except Exception:
                         continue
             except Exception:

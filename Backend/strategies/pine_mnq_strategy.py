@@ -139,11 +139,8 @@ class PineMarketStreamer(MarketStreamer):
         ema_long_ok = (not self.ctx['REQUIRE_PRICE_ABOVE_EMAS']) or (close_px >= ef and close_px >= es)
         ema_short_ok = (not self.ctx['REQUIRE_PRICE_ABOVE_EMAS']) or (close_px <= ef and close_px <= es)
 
-        # Cooldown + open-orders guard
+        # Cooldown guard
         oc = self.ctx['get_open_orders_count'](self.contract_id)
-        if oc > 0:
-            self._last_rel = rel
-            return
         if (time.time() - getattr(self, '_last_signal_ts', 0.0)) < self.ctx['TRADE_COOLDOWN_SEC']:
             self._last_rel = rel
             return
@@ -162,16 +159,121 @@ class PineMarketStreamer(MarketStreamer):
 
         did = False
         if cross_up and vwap_long_ok and ema_long_ok:
+            # If reversing is enabled, flatten/cancel existing orders/position before new entry
+            if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and (oc > 0 or self._has_open_position()):
+                self._flatten_and_cancel()
+                oc = self.ctx['get_open_orders_count'](self.contract_id)
             self._last_signal_ts = now
             self._place_pine_entry_with_brackets(side=0, op=close_px, atr_val=float(atr_val))
             did = True
         elif (not self.ctx['LONG_ONLY']) and cross_dn and vwap_short_ok and ema_short_ok:
+            if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and (oc > 0 or self._has_open_position()):
+                self._flatten_and_cancel()
+                oc = self.ctx['get_open_orders_count'](self.contract_id)
             self._last_signal_ts = now
             self._place_pine_entry_with_brackets(side=1, op=close_px, atr_val=float(atr_val))
             did = True
         self._last_rel = rel
         if did:
             return
+
+    def _has_open_position(self) -> bool:
+        try:
+            token = self.ctx['get_token']()
+            if not token:
+                return False
+            resp = self.ctx['api_post'](token, "/api/Position/searchOpen", {"accountId": self.ctx['ACCOUNT_ID']})
+            pos_list = resp.get("positions") if isinstance(resp, dict) else (resp if isinstance(resp, list) else [])
+            for p in pos_list or []:
+                try:
+                    cid = p.get("contractId") or (p.get("contract") or {}).get("id")
+                    if cid != self.contract_id:
+                        continue
+                    qty = p.get("quantity") or p.get("qty") or p.get("size")
+                    if qty is None:
+                        continue
+                    if float(qty) != 0.0:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    def _flatten_and_cancel(self) -> None:
+        try:
+            token = self.ctx['get_token']()
+            if not token:
+                return
+            # Cancel open orders for this contract
+            try:
+                resp = self.ctx['api_post'](token, "/api/Order/searchOpen", {"accountId": self.ctx['ACCOUNT_ID']})
+                orders = resp.get("orders", []) if isinstance(resp, dict) else []
+                for o in orders:
+                    try:
+                        cid = o.get("contractId") or (o.get("contract") or {}).get("id")
+                        oid = o.get("id") or o.get("orderId")
+                        if cid == self.contract_id and oid is not None:
+                            self.ctx['cancel_order'](token, self.ctx['ACCOUNT_ID'], oid)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            # Close open position on this contract, if any
+            try:
+                presp = self.ctx['api_post'](token, "/api/Position/searchOpen", {"accountId": self.ctx['ACCOUNT_ID']})
+                pos_list = presp.get("positions") if isinstance(presp, dict) else (presp if isinstance(presp, list) else [])
+                for p in pos_list or []:
+                    try:
+                        cid = p.get("contractId") or (p.get("contract") or {}).get("id")
+                        if cid != self.contract_id:
+                            continue
+                        qty = p.get("quantity") or p.get("qty") or p.get("size")
+                        if qty is None:
+                            continue
+                        q = int(abs(int(float(qty))))
+                        if q <= 0:
+                            continue
+                        # Determine side: positive = long -> SELL to flatten; negative = short -> BUY to flatten
+                        side = None
+                        try:
+                            if float(qty) > 0:
+                                side = 1  # SELL
+                            elif float(qty) < 0:
+                                side = 0  # BUY
+                        except Exception:
+                            pass
+                        if side is None:
+                            s = p.get("side")
+                            if s in (0, 1):
+                                side = 1 - int(s)
+                        if side is None:
+                            continue
+                        self.ctx['api_post'](token, "/api/Order/place", {
+                            "accountId": self.ctx['ACCOUNT_ID'],
+                            "contractId": self.contract_id,
+                            "type": 2,
+                            "side": int(side),
+                            "size": int(q),
+                        })
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            # Clear local tracking for this contract to avoid stale state
+            try:
+                for eid, info in list(self.ctx['active_entries'].items()):
+                    if (info or {}).get('contractId') == self.contract_id:
+                        del self.ctx['active_entries'][eid]
+                for eid in list(self.ctx['oco_orders'].keys()):
+                    try:
+                        del self.ctx['oco_orders'][eid]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _place_pine_entry_with_brackets(self, side: int, op: float, atr_val: float):
         token = self.ctx['get_token']()
@@ -419,9 +521,11 @@ def run_strategy_server():
         'INTRABAR_CROSS': bool(STRAT.get("intrabarCross", False)),
         'TRADE_COOLDOWN_SEC': TRADE_COOLDOWN_SEC,
         # Pine: use synthetic trailing activation to convert fixed SL into a native trailing (type 5)
+        # Enable native trailing conversion after activation/BE (so venue shows type=5)
         'TRAILING_STOP_ENABLED': True,
         'SYNTH_TRAILING_ENABLED': True,
-        'FORCE_NATIVE_TRAIL': bool(STRAT.get("forceNativeTrailing", True)),
+        'FORCE_NATIVE_TRAIL': bool(STRAT.get("forceNativeTrailing", False)),
+        'FORCE_FIXED_TRAIL_TICKS': bool(STRAT.get('forceFixedTrailTicks', False)),
         # No default 5-tick override for Pine; leave None unless explicitly configured
         'TRAIL_TICKS_FIXED': (int(STRAT.get("trailDistanceTicks")) if (STRAT.get("trailDistanceTicks") not in (None, '', False)) else None),
         'PAD_TICKS': int(STRAT.get("padTicks", 0)),
@@ -433,6 +537,8 @@ def run_strategy_server():
         # Activation offsets (Pine trail_offset = 0.5 * ATR)
         'TRAIL_OFFSET_K_LONG': float(STRAT.get("atrTrailOffsetKLong", STRAT.get("atrTrailOffsetK", 0.5))),
         'TRAIL_OFFSET_K_SHORT': float(STRAT.get("atrTrailOffsetKShort", STRAT.get("atrTrailOffsetK", 0.5))),
+        # Prefer a specific native trailing variant if provided (e.g., trailingdistance, distanceTicks, trailticks, distance)
+        'TRAIL_VARIANT': str(STRAT.get('trailVariant') or '').strip().lower(),
         'ATR_LENGTH': ATR_LENGTH,
         'MARKET_HUB': MARKET_HUB,
         'risk_per_point': risk_per_point,
@@ -446,6 +552,15 @@ def run_strategy_server():
         'MAX_WEEKLY_LOSS': MAX_WEEKLY_LOSS,
         'WEEKLY_KILL_ACTIVE': False,
         'RISK_PER_TRADE': RISK_PER_TRADE,
+        # Reverse behavior: on a new opposite cross, flatten/cancel and take new signal
+        'REVERSE_ON_CROSS': bool(STRAT.get('reverseOnCross', True)),
+        # Delay new entries briefly after a reverse/flatten to let venue settle
+        'REVERSE_ENTRY_DELAY_SEC': float((config.get('runtime') or {}).get('reverse_entry_delay_sec', 1.0) or 0.0),
+        # Switch to native trailing (type=5) as soon as activation is met
+        'REQUIRE_BEFORE_NATIVE_TRAIL': False,
+        # Optional fixed activation in ticks; if set, overrides ATR-based offset
+        'TRAIL_OFFSET_TICKS_LONG': (int(STRAT.get('trailOffsetTicksLong')) if (STRAT.get('trailOffsetTicksLong') not in (None, '', False)) else (int(STRAT.get('trailOffsetTicks')) if (STRAT.get('trailOffsetTicks') not in (None, '', False)) else None)),
+        'TRAIL_OFFSET_TICKS_SHORT': (int(STRAT.get('trailOffsetTicksShort')) if (STRAT.get('trailOffsetTicksShort') not in (None, '', False)) else (int(STRAT.get('trailOffsetTicks')) if (STRAT.get('trailOffsetTicks') not in (None, '', False)) else None)),
     }
 
     # Monitors

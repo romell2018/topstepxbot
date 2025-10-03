@@ -3,6 +3,6 @@
   "account_id": 11578446,
   "symbol": "MNQ",
   "api_base": "https://api.topstepx.com",
-  "max_contracts": 10,
+  "max_contracts": 30,
   "trail_distance_ticks": 5
 }

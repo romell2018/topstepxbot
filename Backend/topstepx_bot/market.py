@@ -10,6 +10,7 @@ from pathlib import Path
 try:
     from .utils import iso_utc_z  # type: ignore
     from .indicators import ATR, compute_indicators  # type: ignore
+    from .api import _tls_verify_param  # type: ignore
 except Exception:  # pragma: no cover
     try:
         # Ensure project root (parent of package folder) is on sys.path
@@ -19,6 +20,7 @@ except Exception:  # pragma: no cover
             sys.path.insert(0, proj_root)
         from topstepx_bot.utils import iso_utc_z  # type: ignore
         from topstepx_bot.indicators import ATR, compute_indicators  # type: ignore
+        from topstepx_bot.api import _tls_verify_param  # type: ignore
     except Exception:
         # Fallback minimal helper to avoid crashing when printed as script
         def iso_utc_z(ts: dt.datetime) -> str:
@@ -80,7 +82,7 @@ def load_contracts(api_get_token: Callable[[], Optional[str]], contract_map: Dic
                 "x-app-type": "px-desktop",
                 "x-app-version": "1.21.1",
             },
-            verify=False,
+            verify=_tls_verify_param(),
         )
         res.raise_for_status()
         contracts = res.json()

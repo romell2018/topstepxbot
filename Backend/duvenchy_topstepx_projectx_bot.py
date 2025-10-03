@@ -107,7 +107,12 @@ BOOTSTRAP_HISTORY_HOURS = int(config.get("bootstrap_history_hours", 3) or 3)
 
 app = Quart(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Only suppress TLS warnings if explicitly requested via env
+try:
+    if str(os.environ.get("TOPSTEPX_SUPPRESS_TLS_WARNINGS", "0")).strip().lower() in ("1","true","yes","on"):
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
 
 # Global state
 # Shared mutable state the streamer + monitors mutate
@@ -292,6 +297,10 @@ def run_server():
         'STRICT_CROSS_ONLY': bool(STRAT.get("strictCrossOnly", False)),
         'INTRABAR_CROSS': bool(STRAT.get("intrabarCross", False)),
         'TRADE_COOLDOWN_SEC': TRADE_COOLDOWN_SEC,
+        # Reverse behavior: on a new opposite cross, flatten/cancel and take new signal
+        'REVERSE_ON_CROSS': bool(STRAT.get('reverseOnCross', True)),
+        # Delay new entries briefly after a reverse/flatten to let venue settle
+        'REVERSE_ENTRY_DELAY_SEC': float((config.get('runtime') or {}).get('reverse_entry_delay_sec', 1.0) or 0.0),
         'TRAILING_STOP_ENABLED': TRAILING_STOP_ENABLED,
         'AUTO_OCO_ENABLED': AUTO_OCO_ENABLED,
         'POSITION_BRACKETS_ENABLED': POSITION_BRACKETS_ENABLED,
@@ -301,9 +310,12 @@ def run_server():
         'SYNTH_TRAIL_POLL_SEC': max(0.25, float(SYNTH_TRAIL_POLL_SEC)),
         'FORCE_NATIVE_TRAIL': FORCE_NATIVE_TRAIL,
         # fixed native trailing distance in ticks (type 5 orders)
-        # Allow dynamic trailing distance (ATR based) unless explicitly provided in config
-        'TRAIL_TICKS_FIXED': (int(STRAT.get('trailDistanceTicks')) if (STRAT.get('trailDistanceTicks') not in (None, '', False)) else None),
+        'TRAIL_TICKS_FIXED': int(STRAT.get('trailDistanceTicks', 5)),
+        # prefer a specific native trailing variant if provided (e.g., distanceTicks, trailticks, trailingdistance, distance)
+        'TRAIL_VARIANT': str(STRAT.get('trailVariant') or '').strip().lower(),
         'FORCE_FIXED_TRAIL_TICKS': bool(FORCE_FIXED_TRAIL_TICKS),
+        # optionally require BE move before switching to native trailing
+        'REQUIRE_BEFORE_NATIVE_TRAIL': bool(STRAT.get('requireBEBeforeNativeTrail', False)),
         'PAD_TICKS': PAD_TICKS,
         'FIXED_TP_POINTS': FIXED_TP_POINTS,
         'FIXED_SL_POINTS': FIXED_SL_POINTS,
@@ -317,6 +329,9 @@ def run_server():
         # favorably by offset_k * ATR. Default to 0.5 if specified in config.
         'TRAIL_OFFSET_K_LONG': float(STRAT.get('atrTrailOffsetKLong', STRAT.get('atrTrailOffsetK', 0.0))),
         'TRAIL_OFFSET_K_SHORT': float(STRAT.get('atrTrailOffsetKShort', STRAT.get('atrTrailOffsetK', 0.0))),
+        # Optional fixed activation in ticks; if set, overrides ATR-based offset
+        'TRAIL_OFFSET_TICKS_LONG': (int(STRAT.get('trailOffsetTicksLong')) if (STRAT.get('trailOffsetTicksLong') not in (None, '', False)) else (int(STRAT.get('trailOffsetTicks')) if (STRAT.get('trailOffsetTicks') not in (None, '', False)) else None)),
+        'TRAIL_OFFSET_TICKS_SHORT': (int(STRAT.get('trailOffsetTicksShort')) if (STRAT.get('trailOffsetTicksShort') not in (None, '', False)) else (int(STRAT.get('trailOffsetTicks')) if (STRAT.get('trailOffsetTicks') not in (None, '', False)) else None)),
         'ATR_LENGTH': ATR_LENGTH,
         'MARKET_HUB': MARKET_HUB,
         'risk_per_point': risk_per_point,

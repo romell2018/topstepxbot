@@ -28,6 +28,7 @@ class MarketStreamer:
         self._real_bars: int = 0
         self._last_price_log_ts: float = 0.0
         self._tag_counter: int = 0
+        self._reverse_guard_until: float = 0.0
 
     def _unique_tag(self, prefix: str = "ema_cross_auto") -> str:
         try:
@@ -35,6 +36,149 @@ class MarketStreamer:
         except Exception:
             self._tag_counter = 1
         return f"{prefix}_{self.symbol}_{int(time.time()*1000)}_{self._tag_counter}"
+
+    def _has_open_position(self) -> bool:
+        try:
+            token = self.ctx['get_token']()
+            if not token:
+                return False
+            resp = self.ctx['api_post'](token, "/api/Position/searchOpen", {"accountId": self.ctx['ACCOUNT_ID']})
+            pos_list = resp.get("positions") if isinstance(resp, dict) else (resp if isinstance(resp, list) else [])
+            for p in pos_list or []:
+                try:
+                    cid = p.get("contractId") or (p.get("contract") or {}).get("id")
+                    if cid != self.contract_id:
+                        continue
+                    qty = p.get("quantity") or p.get("qty") or p.get("size")
+                    if qty is None:
+                        continue
+                    if float(qty) != 0.0:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    def _flatten_and_cancel(self) -> None:
+        try:
+            token = self.ctx['get_token']()
+            if not token:
+                return
+            # Cancel open orders for this contract
+            try:
+                resp = self.ctx['api_post'](token, "/api/Order/searchOpen", {"accountId": self.ctx['ACCOUNT_ID']})
+                orders = resp.get("orders", []) if isinstance(resp, dict) else []
+                for o in orders:
+                    try:
+                        cid = o.get("contractId") or (o.get("contract") or {}).get("id")
+                        oid = o.get("id") or o.get("orderId")
+                        if cid == self.contract_id and oid is not None:
+                            self.ctx['cancel_order'](token, self.ctx['ACCOUNT_ID'], oid)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            # Secondary safety: if anything lingers, attempt account-wide cancellation
+            try:
+                resp2 = self.ctx['api_post'](token, "/api/Order/searchOpen", {"accountId": self.ctx['ACCOUNT_ID']})
+                orders2 = resp2.get("orders", []) if isinstance(resp2, dict) else []
+                for o in orders2:
+                    try:
+                        oid = o.get("id") or o.get("orderId")
+                        if oid is not None:
+                            self.ctx['cancel_order'](token, self.ctx['ACCOUNT_ID'], oid)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            # Close open position on this contract, if any
+            try:
+                presp = self.ctx['api_post'](token, "/api/Position/searchOpen", {"accountId": self.ctx['ACCOUNT_ID']})
+                pos_list = presp.get("positions") if isinstance(presp, dict) else (presp if isinstance(presp, list) else [])
+                for p in pos_list or []:
+                    try:
+                        cid = p.get("contractId") or (p.get("contract") or {}).get("id")
+                        if cid != self.contract_id:
+                            continue
+                        qty = p.get("quantity") or p.get("qty") or p.get("size")
+                        if qty is None:
+                            continue
+                        q = int(abs(int(float(qty))))
+                        if q <= 0:
+                            continue
+                        # Determine side: positive = long -> SELL to flatten; negative = short -> BUY to flatten
+                        side = None
+                        try:
+                            if float(qty) > 0:
+                                side = 1  # SELL
+                            elif float(qty) < 0:
+                                side = 0  # BUY
+                        except Exception:
+                            pass
+                        if side is None:
+                            s = p.get("side")
+                            if s in (0, 1):
+                                side = 1 - int(s)
+                        if side is None:
+                            continue
+                        self.ctx['api_post'](token, "/api/Order/place", {
+                            "accountId": self.ctx['ACCOUNT_ID'],
+                            "contractId": self.contract_id,
+                            "type": 2,
+                            "side": int(side),
+                            "size": int(q),
+                        })
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            # Clear local tracking for this contract to avoid stale state
+            try:
+                for eid, info in list(self.ctx['active_entries'].items()):
+                    if (info or {}).get('contractId') == self.contract_id:
+                        del self.ctx['active_entries'][eid]
+                for eid in list(self.ctx['oco_orders'].keys()):
+                    try:
+                        del self.ctx['oco_orders'][eid]
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _ensure_flat_and_cleared(self, timeout_sec: float = 3.0) -> bool:
+        """Ensure there are no open orders and no open position for this contract.
+        Attempt cancel/flatten, then poll until both are cleared or timeout.
+        """
+        end_by = time.time() + float(max(0.5, timeout_sec))
+        try:
+            self._reverse_guard_until = end_by
+        except Exception:
+            pass
+        # initial attempt
+        self._flatten_and_cancel()
+        while time.time() < end_by:
+            try:
+                oc = int(self.ctx['get_open_orders_count'](self.contract_id))
+            except Exception:
+                oc = None
+            has_pos = self._has_open_position()
+            if (oc in (0, None)) and (not has_pos):
+                return True
+            time.sleep(0.2)
+        # final snapshot
+        try:
+            oc = int(self.ctx['get_open_orders_count'](self.contract_id))
+        except Exception:
+            oc = None
+        has_pos = self._has_open_position()
+        if oc and oc > 0:
+            logging.warning("Reverse: still have %d open orders after timeout", oc)
+        if has_pos:
+            logging.warning("Reverse: still have open position after timeout")
+        return (oc in (0, None)) and (not has_pos)
 
     def _calc_cross(self, prev_rel: Optional[float], rel: Optional[float], strict: bool) -> (bool, bool):
         try:
@@ -184,6 +328,14 @@ class MarketStreamer:
                 return
         except Exception:
             pass
+        # Guard: skip entries while a reverse/flatten is in progress or cooling down
+        try:
+            if now < float(self._reverse_guard_until):
+                if self.ctx['DEBUG']:
+                    logging.info("Reverse guard active; delaying new entries")
+                return
+        except Exception:
+            pass
         rel = ef - es
         prev_rel = self._last_rel
         cross_up, cross_dn = self._calc_cross(prev_rel, rel, bool(self.ctx.get('STRICT_CROSS_ONLY')))
@@ -198,11 +350,6 @@ class MarketStreamer:
         ema_long_ok = (not self.ctx['REQUIRE_PRICE_ABOVE_EMAS']) or (close_px >= ef and close_px >= es)
         ema_short_ok = (not self.ctx['REQUIRE_PRICE_ABOVE_EMAS']) or (close_px <= ef and close_px <= es)
         oc = self.ctx['get_open_orders_count'](self.contract_id)
-        if oc > 0:
-            self._last_rel = rel
-            if self.ctx['DEBUG']:
-                logging.info("Skip entry: open orders for this contract=%d", oc)
-            return
         if self.ctx['DEBUG'] and (cross_up or cross_dn):
             logging.info(
                 "Cross detected dir=%s | cooldown_ok=%s openOrders=%d vwap_ok=%s/%s ema_ok=%s/%s confirmBars=%d",
@@ -219,6 +366,18 @@ class MarketStreamer:
             if self.ctx.get('FORCE_CROSS_UP'):
                 if vwap_long_ok and ema_long_ok and (now - self._last_signal_ts >= self.ctx['TRADE_COOLDOWN_SEC']):
                     self._last_signal_ts = now
+                    pos_s = self._position_qty_sign()
+                    # If already long, skip to avoid stacking; if short/orders exist, reverse then enter
+                    if pos_s > 0:
+                        logging.info("Skip LONG (force): already long position present")
+                        self._last_rel = rel
+                        return
+                    if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s < 0)):
+                        if not self._ensure_flat_and_cleared():
+                            logging.info("Reverse: not flat/clear yet; skipping new entry")
+                            self._last_rel = rel
+                            return
+                        oc = self.ctx['get_open_orders_count'](self.contract_id)
                     logging.info("Forced LONG entry (forceCrossUp enabled); skipping confirmation")
                     self._place_market_with_brackets(side=0, op=close_px, atr_val=atr_val)
                 else:
@@ -250,9 +409,31 @@ class MarketStreamer:
                             if now - self._last_signal_ts >= self.ctx['TRADE_COOLDOWN_SEC']:
                                 self._last_signal_ts = now
                                 if dir_ == "long":
+                                    pos_s = self._position_qty_sign()
+                                    if pos_s > 0:
+                                        logging.info("Skip LONG: already long position present")
+                                        self._last_rel = rel
+                                        return
+                                    if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s < 0)):
+                                        if not self._ensure_flat_and_cleared():
+                                            logging.info("Reverse: not flat/clear yet; skipping new LONG entry")
+                                            self._last_rel = rel
+                                            return
+                                        oc = self.ctx['get_open_orders_count'](self.contract_id)
                                     logging.info("Entering LONG after %d-bar confirmation", int(self.ctx['CONFIRM_BARS']))
                                     self._place_market_with_brackets(side=0, op=close_px, atr_val=atr_val)
                                 elif (not self.ctx['LONG_ONLY']) and dir_ == "short":
+                                    pos_s = self._position_qty_sign()
+                                    if pos_s < 0:
+                                        logging.info("Skip SHORT: already short position present")
+                                        self._last_rel = rel
+                                        return
+                                    if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s > 0)):
+                                        if not self._ensure_flat_and_cleared():
+                                            logging.info("Reverse: not flat/clear yet; skipping new SHORT entry")
+                                            self._last_rel = rel
+                                            return
+                                        oc = self.ctx['get_open_orders_count'](self.contract_id)
                                     logging.info("Entering SHORT after %d-bar confirmation", int(self.ctx['CONFIRM_BARS']))
                                     self._place_market_with_brackets(side=1, op=close_px, atr_val=atr_val)
                             else:
@@ -267,6 +448,30 @@ class MarketStreamer:
         else:
             if cross_up and vwap_long_ok and ema_long_ok and (now - self._last_signal_ts >= self.ctx['TRADE_COOLDOWN_SEC']):
                 self._last_signal_ts = now
+                pos_s = self._position_qty_sign()
+                if pos_s > 0:
+                    logging.info("Skip LONG: already long position present")
+                    self._last_rel = rel
+                    return
+                if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s < 0)):
+                    if not self._ensure_flat_and_cleared():
+                        logging.info("Reverse: not flat/clear yet; skipping LONG entry on cross")
+                        self._last_rel = rel
+                        return
+                    oc = self.ctx['get_open_orders_count'](self.contract_id)
+                    # Optional post-flatten delay to avoid overlapping entry with cancels
+                    try:
+                        delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
+                    except Exception:
+                        delay = 0.0
+                    if delay > 0:
+                        try:
+                            self._reverse_guard_until = time.time() + delay
+                        except Exception:
+                            pass
+                        logging.info("Reverse: delaying new LONG entry by %.2fs after flatten", delay)
+                        self._last_rel = rel
+                        return
                 logging.info(
                     "Placing LONG on cross | close=%.4f ef=%.4f es=%.4f prev_rel=%.5f rel=%.5f",
                     close_px, ef, es, float(prev_rel) if prev_rel is not None else float('nan'), rel
@@ -274,6 +479,30 @@ class MarketStreamer:
                 self._place_market_with_brackets(side=0, op=close_px, atr_val=atr_val)
             elif (not self.ctx['LONG_ONLY']) and cross_dn and vwap_short_ok and ema_short_ok and (now - self._last_signal_ts >= self.ctx['TRADE_COOLDOWN_SEC']):
                 self._last_signal_ts = now
+                pos_s = self._position_qty_sign()
+                if pos_s < 0:
+                    logging.info("Skip SHORT: already short position present")
+                    self._last_rel = rel
+                    return
+                if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s > 0)):
+                    if not self._ensure_flat_and_cleared():
+                        logging.info("Reverse: not flat/clear yet; skipping SHORT entry on cross")
+                        self._last_rel = rel
+                        return
+                    oc = self.ctx['get_open_orders_count'](self.contract_id)
+                    # Optional post-flatten delay to avoid overlapping entry with cancels
+                    try:
+                        delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
+                    except Exception:
+                        delay = 0.0
+                    if delay > 0:
+                        try:
+                            self._reverse_guard_until = time.time() + delay
+                        except Exception:
+                            pass
+                        logging.info("Reverse: delaying new SHORT entry by %.2fs after flatten", delay)
+                        self._last_rel = rel
+                        return
                 logging.info(
                     "Placing SHORT on cross | close=%.4f ef=%.4f es=%.4f prev_rel=%.5f rel=%.5f",
                     close_px, ef, es, float(prev_rel) if prev_rel is not None else float('nan'), rel
@@ -405,22 +634,11 @@ class MarketStreamer:
         tick_size = float(cm.get("tickSize") or 0.0)
         decimals = int(cm.get("decimalPlaces") or 2)
 
-        # Determine trailing distance (ticks) without forcing a 5-tick default
-        trail_ticks_cfg = None
         try:
-            cfg_ticks = self.ctx.get('TRAIL_TICKS_FIXED')
-            if cfg_ticks is not None:
-                trail_ticks_cfg = int(max(1, int(cfg_ticks)))
+            trail_ticks_cfg = int(self.ctx.get('TRAIL_TICKS_FIXED', 5) or 5)
         except Exception:
-            trail_ticks_cfg = None
-        if trail_ticks_cfg is None and tick_size and tick_size > 0 and atr_val is not None:
-            try:
-                k = float(self.ctx.get('ATR_TRAIL_K_LONG', 1.5)) if side == 0 else float(self.ctx.get('ATR_TRAIL_K_SHORT', 1.0))
-                trail_ticks_cfg = int(max(1, round((float(atr_val) * k) / float(tick_size))))
-            except Exception:
-                trail_ticks_cfg = None
-        if trail_ticks_cfg is None:
-            trail_ticks_cfg = 1
+            trail_ticks_cfg = 5
+        trail_ticks_cfg = int(max(1, trail_ticks_cfg))
 
         # Convert ticks to price distance for sizing and logging
         if tick_size and tick_size > 0:
@@ -535,6 +753,7 @@ class MarketStreamer:
             }
             # Compute price-based distance and an initial stop level if we have entry/tick
             offset_points = None
+            trail_points = None
             stop_init = None
             try:
                 if tick_size and tick_size > 0 and entry_price is not None:
@@ -542,6 +761,12 @@ class MarketStreamer:
                     stop_init = float(entry_price - offset_points) if side == 0 else float(entry_price + offset_points)
                     if decimals is not None:
                         stop_init = round(stop_init, int(decimals))
+                    try:
+                        trail_points = float(abs(int(t_ticks))) * float(tick_size)
+                        if decimals is not None:
+                            trail_points = round(trail_points, int(decimals))
+                    except Exception:
+                        trail_points = None
             except Exception:
                 offset_points = None
                 stop_init = None
@@ -562,9 +787,14 @@ class MarketStreamer:
                 # Prefer absolute start price. Try distancePrice then trailPrice.
                 attempts.append(("distanceprice", lambda: (dict(base, distancePrice=float(stop_init)), None)))
                 attempts.append(("trailprice", lambda: (dict(base, trailPrice=float(stop_init)), None)))
-            attempts.append(("traildistance", lambda: (dict(base, trailDistance=int(max(1, int(t_ticks)))), None)))
-            attempts.append(("distance", lambda: (dict(base, distance=int(max(1, int(t_ticks)))), None)))
-            attempts.append(("distance+traildistance", lambda: (dict(base, distance=int(max(1, int(t_ticks))), trailDistance=int(max(1, int(t_ticks)))), None)))
+            if trail_points is not None:
+                attempts.append(("traildistance", lambda: (dict(base, trailDistance=float(trail_points)), None)))
+                attempts.append(("distance", lambda: (dict(base, distance=float(trail_points)), None)))
+                attempts.append(("distance+traildistance", lambda: (dict(base, distance=float(trail_points), trailDistance=float(trail_points)), None)))
+            else:
+                attempts.append(("traildistance", lambda: (dict(base, trailDistance=int(max(1, int(t_ticks)))), None)))
+                attempts.append(("distance", lambda: (dict(base, distance=int(max(1, int(t_ticks)))), None)))
+                attempts.append(("distance+traildistance", lambda: (dict(base, distance=int(max(1, int(t_ticks))), trailDistance=int(max(1, int(t_ticks)))), None)))
             attempts.append(("distanceticks", lambda: (dict(base, distanceTicks=int(max(1, int(t_ticks)))), None)))
             attempts.append(("trailingdistance", lambda: (dict(base, trailingDistance=int(max(1, int(t_ticks)))), None)))
             # Reorder to prefer the known-good variant
