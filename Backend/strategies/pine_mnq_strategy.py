@@ -276,6 +276,13 @@ class PineMarketStreamer(MarketStreamer):
             pass
 
     def _place_pine_entry_with_brackets(self, side: int, op: float, atr_val: float):
+        # Optional: directly place native trailing stop on entry (skips initial fixed SL/TP)
+        try:
+            if bool(self.ctx.get('FORCE_NATIVE_TRAIL_ON_ENTRY')):
+                self._place_market_with_brackets(side=side, op=op, atr_val=atr_val)
+                return
+        except Exception:
+            pass
         token = self.ctx['get_token']()
         if not token:
             logging.error("Auth failed for placing entry")
@@ -526,6 +533,8 @@ def run_strategy_server():
         'TRAILING_STOP_ENABLED': True,
         'SYNTH_TRAILING_ENABLED': True,
         'FORCE_NATIVE_TRAIL': bool(STRAT.get("forceNativeTrailing", False)),
+        # If set true, place native trailing stop immediately on entry instead of fixed SL -> then convert
+        'FORCE_NATIVE_TRAIL_ON_ENTRY': bool(STRAT.get('forceNativeTrailing', False) or STRAT.get('forceNativeTrailOnEntry', False)),
         'FORCE_FIXED_TRAIL_TICKS': bool(STRAT.get('forceFixedTrailTicks', False)),
         # No default 5-tick override for Pine; leave None unless explicitly configured
         'TRAIL_TICKS_FIXED': (int(STRAT.get("trailDistanceTicks")) if (STRAT.get("trailDistanceTicks") not in (None, '', False)) else None),
