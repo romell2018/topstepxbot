@@ -98,31 +98,36 @@ class PineMarketStreamer(MarketStreamer):
     """
 
     def _maybe_trade(self, close_px: float, ef: float, es: float, vwap_val: Optional[float], atr_val: Optional[float]):
-        # Reuse parent cross + gating logic except we insert optional hour gating and weekly-loss kill gate
+        # Pine logic with robust reverse handling: ensure flat/cleared before new entry and respect a brief guard delay.
         now = time.time()
         if atr_val is None or ef is None or es is None:
             return
 
-        # Global kill-switch or weekly kill gate
+        # Global gates
         if self.ctx.get('TRADING_DISABLED'):
             return
         if bool(self.ctx.get('WEEKLY_KILL_ACTIVE')):
             return
-
-        # Optional hour gating via config.hours.enable["HH"] booleans
         try:
+            # Hour gating via config.hours.enable["HH"] (optional)
             hours_cfg = (self.ctx.get('HOURS_CFG') or {}).get('enable') or {}
             if isinstance(hours_cfg, dict) and hours_cfg:
-                # Determine hour in configured tz (default America/New_York)
                 import datetime as dt
                 from zoneinfo import ZoneInfo
                 tzname = self.ctx.get('TZ') or 'America/New_York'
                 now_dt = dt.datetime.now(ZoneInfo(tzname))
                 hh = f"{now_dt.hour:02d}"
-                ok = bool(hours_cfg.get(hh))
-                if not ok:
-                    self._last_rel = (ef - es)  # keep relation updated for next cross calc
+                if not bool(hours_cfg.get(hh)):
+                    self._last_rel = (ef - es)
                     return
+        except Exception:
+            pass
+
+        # Reverse/cooldown guard (avoid stacking around cancels)
+        try:
+            if now < float(getattr(self, '_reverse_guard_until', 0.0)):
+                self._last_rel = (ef - es)
+                return
         except Exception:
             pass
 
@@ -130,7 +135,6 @@ class PineMarketStreamer(MarketStreamer):
         prev_rel = self._last_rel
         cross_up, cross_dn = self._calc_cross(prev_rel, rel, bool(self.ctx.get('STRICT_CROSS_ONLY')))
 
-        # VWAP and EMA price gating (match parent behavior)
         vwap_long_ok = True
         vwap_short_ok = True
         if self.ctx['USE_VWAP'] and vwap_val is not None:
@@ -139,13 +143,12 @@ class PineMarketStreamer(MarketStreamer):
         ema_long_ok = (not self.ctx['REQUIRE_PRICE_ABOVE_EMAS']) or (close_px >= ef and close_px >= es)
         ema_short_ok = (not self.ctx['REQUIRE_PRICE_ABOVE_EMAS']) or (close_px <= ef and close_px <= es)
 
-        # Cooldown guard
         oc = self.ctx['get_open_orders_count'](self.contract_id)
-        if (time.time() - getattr(self, '_last_signal_ts', 0.0)) < self.ctx['TRADE_COOLDOWN_SEC']:
+        if (now - float(getattr(self, '_last_signal_ts', 0.0))) < float(self.ctx.get('TRADE_COOLDOWN_SEC', 0)):
             self._last_rel = rel
             return
 
-        # Optional N-bar confirmation (unchanged semantics from parent)
+        # Optional N-bar confirmation: store and let subsequent bars complete it
         confirm_n = int(self.ctx.get('CONFIRM_BARS', 0) or 0)
         if confirm_n > 0:
             if cross_up:
@@ -153,29 +156,94 @@ class PineMarketStreamer(MarketStreamer):
             elif (not self.ctx['LONG_ONLY']) and cross_dn:
                 self._pending_signal = {"dir": "short", "bars_left": confirm_n}
             if self._pending_signal:
-                # store last relation and return; parent will decrement at bar close
                 self._last_rel = rel
                 return
 
-        did = False
+        # Entry decisions with reverse safety
         if cross_up and vwap_long_ok and ema_long_ok:
-            # If reversing is enabled, flatten/cancel existing orders/position before new entry
-            if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and (oc > 0 or self._has_open_position()):
-                self._flatten_and_cancel()
+            pos_s = self._position_qty_sign()
+            if pos_s > 0:
+                # Already long; skip stacking
+                self._last_rel = rel
+                return
+            if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s < 0) or self._has_open_position()):
+                # Ensure flat and cleared before attempting new entry
+                if not self._ensure_flat_and_cleared(timeout_sec=3.0):
+                    self._last_rel = rel
+                    return
                 oc = self.ctx['get_open_orders_count'](self.contract_id)
+                # Optional post-flatten delay to avoid contract-limit errors while venue settles
+                try:
+                    delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
+                except Exception:
+                    delay = 0.0
+                if delay > 0:
+                    try:
+                        self._reverse_guard_until = time.time() + delay
+                    except Exception:
+                        pass
+                    self._last_rel = rel
+                    return
             self._last_signal_ts = now
             self._place_pine_entry_with_brackets(side=0, op=close_px, atr_val=float(atr_val))
-            did = True
-        elif (not self.ctx['LONG_ONLY']) and cross_dn and vwap_short_ok and ema_short_ok:
-            if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and (oc > 0 or self._has_open_position()):
-                self._flatten_and_cancel()
+            self._last_rel = rel
+            return
+
+        if (not self.ctx['LONG_ONLY']) and cross_dn and vwap_short_ok and ema_short_ok:
+            pos_s = self._position_qty_sign()
+            if pos_s < 0:
+                # Already short; skip stacking
+                self._last_rel = rel
+                return
+            if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s > 0) or self._has_open_position()):
+                if not self._ensure_flat_and_cleared(timeout_sec=3.0):
+                    self._last_rel = rel
+                    return
                 oc = self.ctx['get_open_orders_count'](self.contract_id)
+                try:
+                    delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
+                except Exception:
+                    delay = 0.0
+                if delay > 0:
+                    try:
+                        self._reverse_guard_until = time.time() + delay
+                    except Exception:
+                        pass
+                    self._last_rel = rel
+                    return
             self._last_signal_ts = now
             self._place_pine_entry_with_brackets(side=1, op=close_px, atr_val=float(atr_val))
-            did = True
-        self._last_rel = rel
-        if did:
+            self._last_rel = rel
             return
+
+        self._last_rel = rel
+
+    def _position_qty_sign(self) -> int:
+        """Return +1 if net long, -1 if net short, 0 if flat/unavailable for this contract."""
+        try:
+            token = self.ctx['get_token']()
+            if not token:
+                return 0
+            resp = self.ctx['api_post'](token, "/api/Position/searchOpen", {"accountId": self.ctx['ACCOUNT_ID']})
+            pos_list = resp.get("positions") if isinstance(resp, dict) else (resp if isinstance(resp, list) else [])
+            for p in pos_list or []:
+                try:
+                    cid = p.get("contractId") or (p.get("contract") or {}).get("id")
+                    if cid != self.contract_id:
+                        continue
+                    qty = p.get("quantity") or p.get("qty") or p.get("size")
+                    if qty is None:
+                        continue
+                    q = float(qty)
+                    if q > 0:
+                        return 1
+                    if q < 0:
+                        return -1
+                except Exception:
+                    continue
+        except Exception:
+            return 0
+        return 0
 
     def _has_open_position(self) -> bool:
         try:
@@ -340,7 +408,87 @@ class PineMarketStreamer(MarketStreamer):
             tp_px = snap_to_tick(op - stop_short_pts * 2.0, tick_size, decimals)
             t_points = trail_short_pts
 
-        # Place TP first (limit)
+        # Place STOP first (safer if side limits are tight); retry once on failure
+        sl_id = None
+        sl_resp = self.ctx['api_post'](token, "/api/Order/place", {
+            "accountId": self.ctx['ACCOUNT_ID'],
+            "contractId": self.contract_id,
+            "type": 4,
+            "side": 1 - side,
+            "size": int(size),
+            "stopPrice": sl_px_fixed,
+            "linkedOrderId": entry_id,
+        })
+        if sl_resp.get("success") and sl_resp.get("orderId"):
+            sl_id = sl_resp.get("orderId")
+            logging.info("Pine SL placed id=%s price=%.4f", str(sl_id), float(sl_px_fixed))
+        else:
+            logging.warning("Pine SL placement failed for entry %s: %s", str(entry_id), sl_resp)
+            # brief retry
+            try:
+                time.sleep(0.2)
+            except Exception:
+                pass
+            sl_resp2 = self.ctx['api_post'](token, "/api/Order/place", {
+                "accountId": self.ctx['ACCOUNT_ID'],
+                "contractId": self.contract_id,
+                "type": 4,
+                "side": 1 - side,
+                "size": int(size),
+                "stopPrice": sl_px_fixed,
+                "linkedOrderId": entry_id,
+            })
+            if sl_resp2.get("success") and sl_resp2.get("orderId"):
+                sl_id = sl_resp2.get("orderId")
+                logging.info("Pine SL placed (retry) id=%s price=%.4f", str(sl_id), float(sl_px_fixed))
+            else:
+                logging.error("Pine SL retry failed for entry %s: %s", str(entry_id), sl_resp2)
+
+        # If fixed SL could not be placed, optionally fall back to native trailing stop immediately
+        if (sl_id is None) and bool(self.ctx.get('TRAILING_STOP_ENABLED', True)):
+            try:
+                # Derive ticks: prefer fixed config; else ATR-based approximation
+                t_ticks = None
+                try:
+                    t_ticks = int(self.ctx.get('TRAIL_TICKS_FIXED')) if (self.ctx.get('TRAIL_TICKS_FIXED') is not None) else None
+                except Exception:
+                    t_ticks = None
+                if (t_ticks is None) and (tick_size and tick_size > 0):
+                    t_pts = trail_long_pts if side == 0 else trail_short_pts
+                    try:
+                        t_ticks = int(max(1, round(abs(t_pts) / float(tick_size))))
+                    except Exception:
+                        t_ticks = None
+                if t_ticks is not None:
+                    tr = self._place_trailing_order(token, entry_id, side, size, int(t_ticks),
+                                                    entry_price=float(op), tick_size=tick_size, decimals=decimals)
+                    if tr and tr.get("success") and tr.get("orderId"):
+                        sl_id = tr.get("orderId")
+                        logging.info("Pine native TRAIL placed id=%s ticks=%s", str(sl_id), str(t_ticks))
+                        # mark native
+                        try:
+                            self.ctx['active_entries'][entry_id] = {
+                                "symbol": self.symbol,
+                                "contractId": self.contract_id,
+                                "side": int(side),
+                                "size": int(size),
+                                "entry": float(op),
+                                "stop_points": float(trail_long_pts if side == 0 else trail_short_pts),
+                                "tp_id": None,
+                                "sl_id": sl_id,
+                                "native_trail": True,
+                                "tickSize": float(tick_size),
+                                "decimals": int(decimals),
+                            }
+                        except Exception:
+                            pass
+                    else:
+                        logging.error("Pine native TRAIL failed for entry %s: %s", str(entry_id), tr)
+            except Exception:
+                logging.exception("Error while placing native trailing fallback")
+
+        # Place TP second (limit). Even if SL failed, TP can still be placed; OCO tracking only if both exist
+        tp_id = None
         tp_order = self.ctx['api_post'](token, "/api/Order/place", {
             "accountId": self.ctx['ACCOUNT_ID'],
             "contractId": self.contract_id,
@@ -350,46 +498,37 @@ class PineMarketStreamer(MarketStreamer):
             "limitPrice": tp_px,
             "linkedOrderId": entry_id,
         })
-        tp_id = tp_order.get("orderId") if tp_order.get("success") else None
-
-        # Place an initial fixed STOP at Pine SL; the synthetic monitor will convert it
-        # to a native trailing stop (type 5) after activation (offset_k * ATR) is reached.
-        sl_id = None
-        r = self.ctx['api_post'](token, "/api/Order/place", {
-                "accountId": self.ctx['ACCOUNT_ID'],
-                "contractId": self.contract_id,
-                "type": 4,
-                "side": 1 - side,
-                "size": int(size),
-                "stopPrice": sl_px_fixed,
-                "linkedOrderId": entry_id,
-            })
-        if r.get("success"):
-            sl_id = r.get("orderId")
+        if tp_order.get("success") and tp_order.get("orderId"):
+            tp_id = tp_order.get("orderId")
+            logging.info("Pine TP placed id=%s price=%.4f", str(tp_id), float(tp_px))
+        else:
+            logging.warning("Pine TP placement failed for entry %s: %s", str(entry_id), tp_order)
 
         # Track OCO pair and active entry for trailing monitor support
-        if entry_id and (tp_id or sl_id):
+        if entry_id and (tp_id is not None) and (sl_id is not None):
             try:
                 self.ctx['oco_orders'][entry_id] = [tp_id, sl_id]
             except Exception:
                 pass
-        cm = self.ctx['contract_map'].get(self.symbol) or {}
-        try:
-            self.ctx['active_entries'][entry_id] = {
-                "symbol": self.symbol,
-                "contractId": self.contract_id,
-                "side": int(side),
-                "size": int(size),
-                "entry": float(op),
-                "stop_points": float(stop_pts),
-                "tp_id": tp_id,
-                "sl_id": sl_id,
-                "native_trail": False,
-                "tickSize": float(cm.get("tickSize") or 0.0),
-                "decimals": int(cm.get("decimalPlaces") or 2),
-            }
-        except Exception:
-            pass
+        # Only set/overwrite active_entries if we did not already mark native_trail in fallback
+        if entry_id not in self.ctx['active_entries']:
+            cm = self.ctx['contract_map'].get(self.symbol) or {}
+            try:
+                self.ctx['active_entries'][entry_id] = {
+                    "symbol": self.symbol,
+                    "contractId": self.contract_id,
+                    "side": int(side),
+                    "size": int(size),
+                    "entry": float(op),
+                    "stop_points": float(stop_pts),
+                    "tp_id": tp_id,
+                    "sl_id": sl_id,
+                    "native_trail": False,
+                    "tickSize": float(cm.get("tickSize") or 0.0),
+                    "decimals": int(cm.get("decimalPlaces") or 2),
+                }
+            except Exception:
+                pass
 
 
 def run_strategy_server():

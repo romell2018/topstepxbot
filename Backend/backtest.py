@@ -12,8 +12,9 @@ import pandas as pd
 from topstepx_bot.api import get_token as _api_get_token, api_post as _api_post
 from topstepx_bot.indicators import ATR, compute_indicators
 from topstepx_bot.utils import snap_to_tick
+# Backend/.venv/bin/python Backend/backtest.py --symbol MNQ --days 13 --commission 0.37 --native-trailing --trail-ticks 4 --trail-offset-ticks 8 --slippage-ticks 1 --exit-sec --plot-equity Backend/equity.png --export-csv Backend/trades_export.csv --print-count 50
 
-#Backend/.venv/bin/python Backend/backtest.py --symbol MNQ --days 2 --commission 0.74 --native-trailing --trail-ticks 4 --trail-offset-ticks 8 --slippage-ticks 1 --ticks data/MNQ_ticks.jsonl --tz America/New_York
+#Backend/.venv/bin/python Backend/backtest.py --symbol MNQ --days 2 --commission 0.74 --native-trailing --trail-ticks 4 --trail-offset-ticks 8 --slippage-ticks 1
 
 # Backend/.venv/bin/python Backend/backtest.py --symbol MNQ --days 2 --commission 0.74 --print-count 50
 
@@ -320,6 +321,9 @@ def backtest_week(
     # Tick-level simulation
     ticks: Optional[pd.DataFrame] = None,
     slippage_ticks: int = 0,
+    # 1-second exit logic
+    sec_bars: Optional[pd.DataFrame] = None,
+    exit_on_sec: bool = False,
 ) -> Tuple[List[Trade], pd.Series]:
     # Compute indicators
     ind = compute_indicators(df, ema_short, ema_long, ema_source, rth_only=False, tzname=tzname)
@@ -440,6 +444,22 @@ def backtest_week(
                                 entry_px_src = float(bid0)
                             elif last0 is not None:
                                 entry_px_src = float(last0)
+                    if entry_px_src is None and bool(exit_on_sec) and (sec_bars is not None):
+                        try:
+                            # Use first 1s bar open within this bucket
+                            bar_seconds = 60
+                            try:
+                                if len(df.index) >= 2:
+                                    step = (df.index[1] - df.index[0]).total_seconds()
+                                    bar_seconds = int(max(1, round(step)))
+                            except Exception:
+                                bar_seconds = 60
+                            t_end = ts + pd.Timedelta(seconds=bar_seconds-1)
+                            sec_slice = sec_bars.loc[ts:t_end]
+                            if not sec_slice.empty:
+                                entry_px_src = float(sec_slice.iloc[0]['open'])
+                        except Exception:
+                            entry_px_src = None
                     if entry_px_src is None and open_px is not None:
                         entry_px_src = float(open_px)
                     if entry_px_src is None:
@@ -653,21 +673,84 @@ def backtest_week(
                             exit_reason = "TP"
                             break
             else:
-                # Conservative bar-level ordering
-                if pos.side == "long":
-                    if (low_px is not None) and (pos.sl is not None) and (low_px <= pos.sl):
-                        exit_price = float(pos.sl)
-                        exit_reason = "SL"
-                    elif (high_px is not None) and (pos.tp is not None) and (high_px >= pos.tp):
-                        exit_price = float(pos.tp)
-                        exit_reason = "TP"
-                else:  # short
-                    if (high_px is not None) and (pos.sl is not None) and (high_px >= pos.sl):
-                        exit_price = float(pos.sl)
-                        exit_reason = "SL"
-                    elif (low_px is not None) and (pos.tp is not None) and (low_px <= pos.tp):
-                        exit_price = float(pos.tp)
-                        exit_reason = "TP"
+                # If requested, use 1-second bars for exit logic
+                used_sec = False
+                if bool(exit_on_sec) and (sec_bars is not None):
+                    try:
+                        bar_seconds = 60
+                        try:
+                            if len(df.index) >= 2:
+                                step = (df.index[1] - df.index[0]).total_seconds()
+                                bar_seconds = int(max(1, round(step)))
+                        except Exception:
+                            bar_seconds = 60
+                        t_end = ts + pd.Timedelta(seconds=bar_seconds-1)
+                        sec_slice = sec_bars.loc[ts:t_end]
+                        if not sec_slice.empty:
+                            used_sec = True
+                            for _, sb in sec_slice.iterrows():
+                                s_open = float(sb.get('open')) if not pd.isna(sb.get('open')) else None
+                                s_high = float(sb.get('high')) if not pd.isna(sb.get('high')) else None
+                                s_low = float(sb.get('low')) if not pd.isna(sb.get('low')) else None
+                                # Update trailing using favorable extreme
+                                if use_native_trailing and (tick_size and tick_size > 0):
+                                    if (force_fixed_trail_ticks and (trail_ticks_fixed is not None)):
+                                        t_ticks = int(max(1, int(trail_ticks_fixed)))
+                                        trail_points = float(t_ticks) * float(tick_size)
+                                    else:
+                                        k = float(atr_trail_k_long) if pos.side == "long" else float(atr_trail_k_short)
+                                        trail_points = float(atr_val) * float(k) if atr_val is not None else None
+                                        if (trail_points is None or trail_points <= 0) and (trail_ticks_fixed is not None):
+                                            t_ticks = int(max(1, int(trail_ticks_fixed)))
+                                            trail_points = float(t_ticks) * float(tick_size)
+                                    if trail_points is not None and trail_points > 0:
+                                        if pos.side == "long" and (s_high is not None):
+                                            new_stop = snap_to_tick(float(s_high) - trail_points, tick_size, price_decimals)
+                                            if (pos.trailing_stop is None) or (new_stop > pos.trailing_stop):
+                                                pos.trailing_stop = new_stop
+                                                pos.sl = new_stop
+                                        elif pos.side == "short" and (s_low is not None):
+                                            new_stop = snap_to_tick(float(s_low) + trail_points, tick_size, price_decimals)
+                                            if (pos.trailing_stop is None) or (new_stop < pos.trailing_stop):
+                                                pos.trailing_stop = new_stop
+                                                pos.sl = new_stop
+                                # SL/TP checks on 1-second bar
+                                if pos.side == "long":
+                                    if (pos.sl is not None) and (s_low is not None) and (s_low <= pos.sl):
+                                        exit_price = _apply_slippage(float(pos.sl), pos.side, kind="stop")
+                                        exit_reason = "SL"
+                                        break
+                                    if (pos.tp is not None) and (s_high is not None) and (s_high >= pos.tp):
+                                        exit_price = float(pos.tp)
+                                        exit_reason = "TP"
+                                        break
+                                else:
+                                    if (pos.sl is not None) and (s_high is not None) and (s_high >= pos.sl):
+                                        exit_price = _apply_slippage(float(pos.sl), pos.side, kind="stop")
+                                        exit_reason = "SL"
+                                        break
+                                    if (pos.tp is not None) and (s_low is not None) and (s_low <= pos.tp):
+                                        exit_price = float(pos.tp)
+                                        exit_reason = "TP"
+                                        break
+                    except Exception:
+                        used_sec = False
+                if not used_sec:
+                    # Conservative bar-level ordering (minute or main bar timeframe)
+                    if pos.side == "long":
+                        if (low_px is not None) and (pos.sl is not None) and (low_px <= pos.sl):
+                            exit_price = float(pos.sl)
+                            exit_reason = "SL"
+                        elif (high_px is not None) and (pos.tp is not None) and (high_px >= pos.tp):
+                            exit_price = float(pos.tp)
+                            exit_reason = "TP"
+                    else:  # short
+                        if (high_px is not None) and (pos.sl is not None) and (high_px >= pos.sl):
+                            exit_price = float(pos.sl)
+                            exit_reason = "SL"
+                        elif (low_px is not None) and (pos.tp is not None) and (low_px <= pos.tp):
+                            exit_price = float(pos.tp)
+                            exit_reason = "TP"
 
             # If neither bracket hit and reverse-on-cross, flatten at close when opposite signal fires
             will_reverse = False
@@ -799,10 +882,13 @@ def main():
     ap.add_argument("--ticks", type=str, default=None, help="Path to JSONL ticks file recorded via tools/record_ticks.py")
     ap.add_argument("--slippage-ticks", type=int, default=0, help="Adverse slippage in ticks applied to fills")
     ap.add_argument("--sec-bars", action="store_true", help="Use 1-second bars for indicators (from ticks if provided, else API)")
+    ap.add_argument("--exit-sec", action="store_true", help="Use 1-second bars (or ticks) for exit logic while keeping entries/signals on main bars")
     ap.add_argument("--csv", type=str, default=None, help="Path to CSV file with either OHLCV bars or tick data (auto-detected)")
     ap.add_argument("--csv-type", type=str, choices=["auto", "bars", "ticks"], default="auto", help="Interpret CSV as bars or ticks (default auto)")
     ap.add_argument("--csv-tz", type=str, default=None, help="Timezone for naive CSV timestamps (if no tz info present)")
     ap.add_argument("--export-csv", type=str, default=None, help="Write trade ledger to CSV at this path")
+    ap.add_argument("--export-equity-csv", type=str, default=None, help="Write equity curve to CSV at this path")
+    ap.add_argument("--plot-equity", type=str, default=None, help="Save equity curve plot to this PNG path")
     ap.add_argument("--ema-short", type=int, default=None, help="EMA fast length (default from config)")
     ap.add_argument("--ema-long", type=int, default=None, help="EMA slow length (default from config)")
     ap.add_argument("--atr-length", type=int, default=None, help="ATR length (default from config)")
@@ -835,7 +921,7 @@ def main():
     long_only = bool(args.long_only or strat.get("longOnly", False))
     reverse_on_cross = (not args.no_reverse) and bool(strat.get("reverseOnCross", True))
     risk_per_trade = float(strat.get("riskPerTrade", 500.0))
-    contract_size_max = int(strat.get("contractSizeMax", 5))
+    contract_size_max = int(strat.get("contractSizeMax", 15))
     short_size_factor = float(strat.get("shortSizeFactor", 0.75))
 
     instr = cfg.get("instrument", {})
@@ -918,6 +1004,18 @@ def main():
     pad_ticks = int(args.pad_ticks) if args.pad_ticks is not None else int(strat.get("padTicks", 0))
 
     # ticks_df is already loaded above if provided
+    # Prepare optional 1-second bars for exit logic
+    sec_bars: Optional[pd.DataFrame] = None
+    if bool(args.exit_sec):
+        if (ticks_df is not None) and (not ticks_df.empty):
+            sec_bars = _resample_ticks_to_bars(ticks_df, seconds=1)
+        else:
+            try:
+                sec_items = _history_fetch(api_url, token, contract_id, start, end, unit=1, unit_n=1, live=True, include_partial=True)
+                if sec_items:
+                    sec_bars = _bars_to_df(sec_items)
+            except Exception:
+                sec_bars = None
 
     trades, eq = backtest_week(
         df=df,
@@ -947,6 +1045,8 @@ def main():
         tzname=tzname,
         ticks=ticks_df,
         slippage_ticks=int(args.slippage_ticks or 0),
+        sec_bars=sec_bars,
+        exit_on_sec=bool(args.exit_sec),
     )
 
     summary = _summarize(trades, initial_cash=float(args.cash))
@@ -956,6 +1056,54 @@ def main():
     print(f"Trades: {summary['trades']} | Wins: {summary['wins']} | Losses: {summary['losses']} | Win%: {summary['win_rate_pct']:.1f}")
     print(f"Net PnL: ${summary['net_pnl']:.2f} | End Cash: ${summary['ending_cash']:.2f}")
     print(f"Avg Win: ${summary['avg_win']:.2f} | Avg Loss: ${summary['avg_loss']:.2f} | R/R: {summary['reward_risk']}")
+
+    # Optional: export equity to CSV
+    if args.export_equity_csv and (eq is not None) and (not eq.empty):
+        try:
+            out_path_eq = Path(args.export_equity_csv).expanduser()
+            out_path_eq.parent.mkdir(parents=True, exist_ok=True)
+            # Convert index to desired tz for readability
+            eq_out = eq.copy()
+            try:
+                eq_out.index = eq_out.index.tz_convert(tzname)
+            except Exception:
+                pass
+            eq_out = eq_out.rename("equity")
+            eq_out.to_csv(out_path_eq, header=True)
+            print(f"Wrote equity CSV: {out_path_eq}")
+        except Exception as e:
+            print(f"Failed to export equity CSV: {e}")
+
+    # Optional: save equity plot
+    if args.plot_equity and (eq is not None) and (not eq.empty):
+        try:
+            # Lazy import matplotlib only if plotting is requested
+            import matplotlib
+            matplotlib.use("Agg")  # headless backend
+            import matplotlib.pyplot as plt
+
+            eq_plot = eq.copy()
+            try:
+                eq_plot.index = eq_plot.index.tz_convert(tzname)
+            except Exception:
+                pass
+            # Plot starting cash + equity
+            y = eq_plot + float(args.cash)
+            fig, ax = plt.subplots(figsize=(10, 4))
+            ax.plot(y.index, y.values, label="Equity")
+            ax.set_title(f"Equity Curve – {symbol}")
+            ax.set_xlabel(f"Time ({tzname})")
+            ax.set_ylabel("Account Value ($)")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="best")
+            out_path_png = Path(args.plot_equity).expanduser()
+            out_path_png.parent.mkdir(parents=True, exist_ok=True)
+            fig.tight_layout()
+            fig.savefig(out_path_png, dpi=150)
+            plt.close(fig)
+            print(f"Saved equity plot: {out_path_png}")
+        except Exception as e:
+            print(f"Failed to plot equity: {e}. If missing, install matplotlib in your venv.")
 
     # Optional: export trades to CSV
     if args.export_csv and trades:
