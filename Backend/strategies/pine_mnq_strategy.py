@@ -601,7 +601,7 @@ def run_strategy_server():
         return float(RISK_PER_TRADE)
 
     # Compose context for streamer + monitors
-        ctx: Dict[str, Any] = {
+    ctx: Dict[str, Any] = {
         'get_token': get_token,
         'api_post': api_post,
         'get_account_info': get_account_info,
