@@ -161,27 +161,9 @@ class PineMarketStreamer(MarketStreamer):
 
         # Entry decisions with reverse safety
         if cross_up and vwap_long_ok and ema_long_ok:
-            pos_s = self._position_qty_sign()
-            if pos_s > 0:
-                # Already long; skip stacking
-                self._last_rel = rel
-                return
-            if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s < 0) or self._has_open_position()):
-                # Ensure flat and cleared before attempting new entry
-                if not self._ensure_flat_and_cleared(timeout_sec=3.0):
-                    self._last_rel = rel
-                    return
-                oc = self.ctx['get_open_orders_count'](self.contract_id)
-                # Optional post-flatten delay to avoid contract-limit errors while venue settles
-                try:
-                    delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
-                except Exception:
-                    delay = 0.0
-                if delay > 0:
-                    try:
-                        self._reverse_guard_until = time.time() + delay
-                    except Exception:
-                        pass
+            # Always preflight-cancel/flatten before any new entry if enabled
+            if bool(self.ctx.get('ALWAYS_FLATTEN_BEFORE_ENTRY', True)):
+                if not self._ensure_flat_and_cleared(timeout_sec=5.0):
                     self._last_rel = rel
                     return
             self._last_signal_ts = now
@@ -190,25 +172,8 @@ class PineMarketStreamer(MarketStreamer):
             return
 
         if (not self.ctx['LONG_ONLY']) and cross_dn and vwap_short_ok and ema_short_ok:
-            pos_s = self._position_qty_sign()
-            if pos_s < 0:
-                # Already short; skip stacking
-                self._last_rel = rel
-                return
-            if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s > 0) or self._has_open_position()):
-                if not self._ensure_flat_and_cleared(timeout_sec=3.0):
-                    self._last_rel = rel
-                    return
-                oc = self.ctx['get_open_orders_count'](self.contract_id)
-                try:
-                    delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
-                except Exception:
-                    delay = 0.0
-                if delay > 0:
-                    try:
-                        self._reverse_guard_until = time.time() + delay
-                    except Exception:
-                        pass
+            if bool(self.ctx.get('ALWAYS_FLATTEN_BEFORE_ENTRY', True)):
+                if not self._ensure_flat_and_cleared(timeout_sec=5.0):
                     self._last_rel = rel
                     return
             self._last_signal_ts = now
@@ -636,7 +601,7 @@ def run_strategy_server():
         return float(RISK_PER_TRADE)
 
     # Compose context for streamer + monitors
-    ctx: Dict[str, Any] = {
+        ctx: Dict[str, Any] = {
         'get_token': get_token,
         'api_post': api_post,
         'get_account_info': get_account_info,
@@ -703,6 +668,10 @@ def run_strategy_server():
         'RISK_PER_TRADE': RISK_PER_TRADE,
         # Reverse behavior: on a new opposite cross, flatten/cancel and take new signal
         'REVERSE_ON_CROSS': bool(STRAT.get('reverseOnCross', True)),
+        # Always preflight cancel all open orders (account-wide) and flatten any open
+        # position before placing a new entry (safer with venues that enforce strict
+        # side limits and slow cancel propagation)
+        'ALWAYS_FLATTEN_BEFORE_ENTRY': bool((config.get('runtime') or {}).get('always_flatten_before_entry', True)),
         # Delay new entries briefly after a reverse/flatten to let venue settle
         'REVERSE_ENTRY_DELAY_SEC': float((config.get('runtime') or {}).get('reverse_entry_delay_sec', 1.0) or 0.0),
         # Switch to native trailing (type=5) as soon as activation is met
