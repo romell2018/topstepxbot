@@ -318,6 +318,7 @@ def backtest_week(
     atr_trail_offset_k: float = 0.0,
     pad_ticks: int = 0,
     tzname: str = "America/New_York",
+    rth_only: bool = False,
     # Tick-level simulation
     ticks: Optional[pd.DataFrame] = None,
     slippage_ticks: int = 0,
@@ -325,8 +326,8 @@ def backtest_week(
     sec_bars: Optional[pd.DataFrame] = None,
     exit_on_sec: bool = False,
 ) -> Tuple[List[Trade], pd.Series]:
-    # Compute indicators
-    ind = compute_indicators(df, ema_short, ema_long, ema_source, rth_only=False, tzname=tzname)
+    # Compute indicators (optionally restrict to RTH using tzname)
+    ind = compute_indicators(df, ema_short, ema_long, ema_source, rth_only=bool(rth_only), tzname=tzname)
     ef_key = f"ema{ema_short}"
     es_key = f"ema{ema_long}"
     ind["rel"] = ind[ef_key] - ind[es_key]
@@ -886,6 +887,7 @@ def main():
     ap.add_argument("--csv", type=str, default=None, help="Path to CSV file with either OHLCV bars or tick data (auto-detected)")
     ap.add_argument("--csv-type", type=str, choices=["auto", "bars", "ticks"], default="auto", help="Interpret CSV as bars or ticks (default auto)")
     ap.add_argument("--csv-tz", type=str, default=None, help="Timezone for naive CSV timestamps (if no tz info present)")
+    ap.add_argument("--rth-only", action="store_true", help="Filter to regular trading hours (09:30–16:00 in --tz zone)")
     ap.add_argument("--export-csv", type=str, default=None, help="Write trade ledger to CSV at this path")
     ap.add_argument("--export-equity-csv", type=str, default=None, help="Write equity curve to CSV at this path")
     ap.add_argument("--plot-equity", type=str, default=None, help="Save equity curve plot to this PNG path")
@@ -1043,6 +1045,7 @@ def main():
         atr_trail_offset_k=atr_trail_offset_k,
         pad_ticks=pad_ticks,
         tzname=tzname,
+        rth_only=bool(args.rth_only),
         ticks=ticks_df,
         slippage_ticks=int(args.slippage_ticks or 0),
         sec_bars=sec_bars,
@@ -1056,6 +1059,31 @@ def main():
     print(f"Trades: {summary['trades']} | Wins: {summary['wins']} | Losses: {summary['losses']} | Win%: {summary['win_rate_pct']:.1f}")
     print(f"Net PnL: ${summary['net_pnl']:.2f} | End Cash: ${summary['ending_cash']:.2f}")
     print(f"Avg Win: ${summary['avg_win']:.2f} | Avg Loss: ${summary['avg_loss']:.2f} | R/R: {summary['reward_risk']}")
+
+    # Daily PnL breakdown (using equity curve, in chosen timezone)
+    try:
+        if (eq is not None) and (not eq.empty):
+            eq_daily = eq.copy()
+            try:
+                eq_daily.index = eq_daily.index.tz_convert(tzname)
+            except Exception:
+                pass
+            daily_end = eq_daily.resample('D').last()
+            if daily_end is not None and len(daily_end) > 0:
+                daily_pnl = daily_end.diff()
+                # First day PnL relative to starting equity (0)
+                if pd.isna(daily_pnl.iloc[0]):
+                    daily_pnl.iloc[0] = float(daily_end.iloc[0]) - 0.0
+                print("\nDaily PnL")
+                print("---------")
+                for ts, val in daily_pnl.items():
+                    try:
+                        day = ts.date()
+                    except Exception:
+                        day = str(ts)
+                    print(f"{day}: ${float(val):,.2f}")
+    except Exception as e:
+        print(f"Failed to compute daily PnL: {e}")
 
     # Optional: export equity to CSV
     if args.export_equity_csv and (eq is not None) and (not eq.empty):

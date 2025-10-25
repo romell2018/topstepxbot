@@ -29,6 +29,20 @@ class MarketStreamer:
         self._last_price_log_ts: float = 0.0
         self._tag_counter: int = 0
         self._reverse_guard_until: float = 0.0
+        # Stream health markers
+        try:
+            if 'STREAM_CONNECTED' not in self.ctx:
+                self.ctx['STREAM_CONNECTED'] = False
+            if 'last_stream_event_ts' not in self.ctx:
+                self.ctx['last_stream_event_ts'] = 0.0
+        except Exception:
+            pass
+
+    def _mark_stream_event(self) -> None:
+        try:
+            self.ctx['last_stream_event_ts'] = time.time()
+        except Exception:
+            pass
 
     def _unique_tag(self, prefix: str = "ema_cross_auto") -> str:
         try:
@@ -965,6 +979,7 @@ class MarketStreamer:
             except Exception:
                 pass
             self._ingest(t, price, 0.0)
+            self._mark_stream_event()
         except Exception:
             pass
 
@@ -980,6 +995,7 @@ class MarketStreamer:
                 return
             t = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00")).astimezone(dt.timezone.utc)
             self._ingest(t, price, vol)
+            self._mark_stream_event()
         except Exception:
             pass
 
@@ -1002,7 +1018,7 @@ class MarketStreamer:
         def attach_lifecycle(c):
             try:
                 c.on_open(lambda: self._on_open())
-                c.on_close(lambda: logging.info("Market hub closed"))
+                c.on_close(self._on_close)
                 c.on_error(lambda data: logging.error(f"Market hub error: {data}"))
                 if hasattr(c, "on_reconnecting"):
                     c.on_reconnecting(lambda: logging.info("Market hub reconnecting"))
@@ -1028,6 +1044,11 @@ class MarketStreamer:
 
     def _on_open(self, reconnect: bool = False):
         logging.info("Market hub connected%s", " (reconnected)" if reconnect else "")
+        try:
+            self.ctx['STREAM_CONNECTED'] = True
+        except Exception:
+            pass
+        self._mark_stream_event()
         if self.conn and not self._subscribed:
             try:
                 self.conn.send("SubscribeContractQuotes", [self.contract_id])
@@ -1036,3 +1057,10 @@ class MarketStreamer:
                 logging.info(f"Subscribed market stream for {self.symbol} / {self.contract_id}")
             except Exception as e:
                 logging.error(f"Subscribe failed: {e}")
+
+    def _on_close(self):
+        try:
+            self.ctx['STREAM_CONNECTED'] = False
+        except Exception:
+            pass
+        logging.info("Market hub closed")

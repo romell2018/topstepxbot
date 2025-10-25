@@ -681,11 +681,170 @@ def run_strategy_server():
         'TRAIL_OFFSET_TICKS_SHORT': (int(STRAT.get('trailOffsetTicksShort')) if (STRAT.get('trailOffsetTicksShort') not in (None, '', False)) else (int(STRAT.get('trailOffsetTicks')) if (STRAT.get('trailOffsetTicks') not in (None, '', False)) else None)),
     }
 
+    # Stream health defaults
+    ctx['STREAM_CONNECTED'] = False
+    ctx['last_stream_event_ts'] = 0.0
+    ctx['START_TS'] = time.time()
+
     # Monitors
     ctx['monitor_oco_orders'] = make_monitor_oco_orders(ctx)
     ctx['monitor_account_snapshot'] = make_monitor_account_snapshot(ctx)
     ctx['monitor_synth_trailing'] = make_monitor_synth_trailing(ctx)
     ctx['get_open_orders_count'] = make_get_open_orders_count(ctx)
+
+    # On boot or after a restart, rebuild local tracking from venue state
+    def rebuild_open_state() -> None:
+        try:
+            tok = get_token()
+            if not tok:
+                logging.warning("State rebuild skipped: no token")
+                return
+            # Resolve current contract id for the configured symbol
+            load_contracts()
+            contract = (contract_map.get(SYMBOL)
+                        or contract_map.get(f"US.{SYMBOL}")
+                        or next((v for k, v in contract_map.items() if k.upper().startswith(f"{SYMBOL}.") or k.upper().endswith(f".{SYMBOL}")), None))
+            if not contract:
+                return
+            cid = contract.get("contractId")
+            tick_size = float(contract.get("tickSize") or 0.0)
+            decimals = int(contract.get("decimalPlaces") or 2)
+            # Fetch open orders
+            ores = api_post(tok, "/api/Order/searchOpen", {"accountId": ACCOUNT_ID})
+            orders = ores.get("orders", []) if isinstance(ores, dict) else []
+            # Group children by linked parent (entry) id
+            groups: Dict[Any, Dict[str, Any]] = {}
+            for o in orders:
+                try:
+                    ocid = o.get("contractId") or (o.get("contract") or {}).get("id")
+                    if ocid != cid:
+                        continue
+                    typ = o.get("type")
+                    if typ not in (1, 4, 5):
+                        continue
+                    pid = o.get("linkedOrderId")
+                    oid = o.get("id") or o.get("orderId")
+                    if not pid or oid is None:
+                        continue
+                    g = groups.setdefault(pid, {"tp": None, "sl": None, "sl_type": None, "size": None, "entry_side": None})
+                    if g.get("size") is None:
+                        try:
+                            g["size"] = int(abs(int(float(o.get("size") or 1))))
+                        except Exception:
+                            g["size"] = 1
+                    try:
+                        # child side is opposite of entry side
+                        cs = o.get("side")
+                        if cs in (0, 1):
+                            g["entry_side"] = 1 - int(cs)
+                    except Exception:
+                        pass
+                    if typ == 1:
+                        g["tp"] = {"id": oid, "price": o.get("limitPrice")}
+                    elif typ in (4, 5):
+                        g["sl"] = {"id": oid, "price": o.get("stopPrice")}
+                        g["sl_type"] = int(typ)
+                except Exception:
+                    continue
+            # Attempt to infer current open position avg price (if provided by API)
+            avg_px: Optional[float] = None
+            pos_side_sign = 0
+            try:
+                pres = api_post(tok, "/api/Position/searchOpen", {"accountId": ACCOUNT_ID})
+                plist = pres.get("positions") if isinstance(pres, dict) else (pres if isinstance(pres, list) else [])
+                for p in plist or []:
+                    try:
+                        pcid = p.get("contractId") or (p.get("contract") or {}).get("id")
+                        if pcid != cid:
+                            continue
+                        q = p.get("quantity") or p.get("qty") or p.get("size")
+                        if q is None:
+                            continue
+                        qf = float(q)
+                        if qf == 0.0:
+                            continue
+                        pos_side_sign = 1 if qf > 0 else -1
+                        # Try common avg price fields
+                        for k in ("avgPrice", "averagePrice", "avgEntry", "price", "entryPrice"):
+                            v = p.get(k)
+                            if v is not None:
+                                try:
+                                    avg_px = float(v)
+                                    break
+                                except Exception:
+                                    pass
+                        break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            # Rebuild local maps
+            for entry_id, g in groups.items():
+                tp = g.get("tp")
+                sl = g.get("sl")
+                if not tp or not sl:
+                    continue
+                tp_id = tp.get("id"); sl_id = sl.get("id")
+                if tp_id is None or sl_id is None:
+                    continue
+                try:
+                    ctx['oco_orders'][entry_id] = [tp_id, sl_id]
+                except Exception:
+                    pass
+                native = (g.get("sl_type") == 5)
+                side = int(g.get("entry_side") if g.get("entry_side") in (0, 1) else (0 if pos_side_sign > 0 else 1))
+                size = int(g.get("size") or 1)
+                # Attempt to infer entry price and stop distance when not trailing
+                entry_px: Optional[float] = None
+                stop_pts: Optional[float] = None
+                try:
+                    tp_px = float(tp.get("price")) if tp.get("price") is not None else None
+                except Exception:
+                    tp_px = None
+                try:
+                    sl_px = float(sl.get("price")) if sl.get("price") is not None else None
+                except Exception:
+                    sl_px = None
+                if not native and (tp_px is not None) and (sl_px is not None):
+                    try:
+                        if side == 0:
+                            # LONG: tp - op = 3s, op - sl = s => s = (tp - sl)/4, op = sl + s
+                            s = (tp_px - sl_px) / 4.0
+                            entry_px = sl_px + s
+                            stop_pts = s
+                        else:
+                            # SHORT: op - tp = 2s, sl - op = s => s = (sl - tp)/3, op = sl - s
+                            s = (sl_px - tp_px) / 3.0
+                            entry_px = sl_px - s
+                            stop_pts = s
+                    except Exception:
+                        entry_px = None
+                        stop_pts = None
+                if entry_px is None and avg_px is not None:
+                    entry_px = avg_px
+                info = {
+                    "symbol": SYMBOL,
+                    "contractId": cid,
+                    "side": side,
+                    "size": size,
+                    "entry": entry_px if entry_px is not None else 0.0,
+                    "stop_points": stop_pts,
+                    "tp_id": tp_id,
+                    "sl_id": sl_id,
+                    "native_trail": bool(native),
+                    "tickSize": float(tick_size),
+                    "decimals": int(decimals),
+                }
+                try:
+                    ctx['active_entries'][entry_id] = info
+                except Exception:
+                    pass
+            if ctx['oco_orders']:
+                logging.info("Rebuilt %d OCO groups from venue state", len(ctx['oco_orders']))
+            if ctx['active_entries']:
+                logging.info("Rebuilt %d active entries from venue state", len(ctx['active_entries']))
+        except Exception:
+            logging.exception("Failed to rebuild open state")
 
     # Weekly loss watcher (lightweight): if equity drop since start > limit, gate new entries
     def weekly_kill_watchdog():
@@ -743,10 +902,209 @@ def run_strategy_server():
 
     # Start monitors
     load_contracts()
+    # Rebuild tracking before monitors begin to avoid orphan logic surprises
+    rebuild_open_state()
     threading.Thread(target=lambda: asyncio_run(ctx['monitor_oco_orders']()), daemon=True).start()
     threading.Thread(target=lambda: asyncio_run(ctx['monitor_account_snapshot']()), daemon=True).start()
     threading.Thread(target=lambda: asyncio_run(ctx['monitor_synth_trailing']()), daemon=True).start()
     threading.Thread(target=weekly_kill_watchdog, daemon=True).start()
+
+    # Flatten on hour boundaries when the new hour is disabled by hours.enable
+    def hour_boundary_watchdog():
+        runtime = config.get('runtime') or {}
+        flatten_on_disabled = bool(runtime.get('flatten_on_disabled_hour', True))
+        flatten_on_any = bool(runtime.get('flatten_on_any_hour_boundary', False))
+        hours_cfg = (config.get('hours') or {}).get('enable') or {}
+        if not flatten_on_disabled and not flatten_on_any:
+            return
+        try:
+            from zoneinfo import ZoneInfo
+            import datetime as dt
+        except Exception:
+            logging.warning("Hour boundary watchdog disabled: zoneinfo not available")
+            return
+        last_hour = None
+        while True:
+            try:
+                tzname = config.get('tz') or 'America/New_York'
+                now_dt = dt.datetime.now(ZoneInfo(tzname))
+                hh = now_dt.hour
+                if last_hour is None:
+                    last_hour = hh
+                if hh != last_hour:
+                    # Entered a new hour
+                    do_flatten = False
+                    if flatten_on_any:
+                        do_flatten = True
+                    elif isinstance(hours_cfg, dict) and hours_cfg:
+                        hkey = f"{hh:02d}"
+                        enabled = bool(hours_cfg.get(hkey))
+                        if not enabled:
+                            do_flatten = True
+                    if do_flatten:
+                        try:
+                            # Resolve current contract id
+                            contract = (contract_map.get(SYMBOL)
+                                        or contract_map.get(f"US.{SYMBOL}")
+                                        or next((v for k, v in contract_map.items() if k.upper().startswith(f"{SYMBOL}.") or k.upper().endswith(f".{SYMBOL}")), None))
+                            contract_id = contract.get('contractId') if isinstance(contract, dict) else (config.get('CONTRACT_ID') or None)
+                        except Exception:
+                            contract_id = (config.get('CONTRACT_ID') or None)
+                        if contract_id is None:
+                            logging.warning("Hour boundary flatten: contract id unavailable")
+                        else:
+                            try:
+                                tok = get_token()
+                                if tok:
+                                    # Cancel all open orders for this contract
+                                    try:
+                                        resp = api_post(tok, "/api/Order/searchOpen", {"accountId": ACCOUNT_ID})
+                                        orders = resp.get("orders", []) if isinstance(resp, dict) else []
+                                        for o in orders:
+                                            try:
+                                                cid = o.get("contractId") or (o.get("contract") or {}).get("id")
+                                                oid = o.get("id") or o.get("orderId")
+                                                if cid == contract_id and oid is not None:
+                                                    cancel_order(tok, ACCOUNT_ID, oid)
+                                            except Exception:
+                                                continue
+                                    except Exception:
+                                        pass
+                                    # Flatten any open position on this contract
+                                    try:
+                                        presp = api_post(tok, "/api/Position/searchOpen", {"accountId": ACCOUNT_ID})
+                                        pos_list = presp.get("positions") if isinstance(presp, dict) else (presp if isinstance(presp, list) else [])
+                                        for p in pos_list or []:
+                                            try:
+                                                cid = p.get("contractId") or (p.get("contract") or {}).get("id")
+                                                if cid != contract_id:
+                                                    continue
+                                                qty = p.get("quantity") or p.get("qty") or p.get("size")
+                                                if qty is None:
+                                                    continue
+                                                q = int(abs(int(float(qty))))
+                                                if q <= 0:
+                                                    continue
+                                                side = None
+                                                try:
+                                                    if float(qty) > 0:
+                                                        side = 1  # SELL to flatten long
+                                                    elif float(qty) < 0:
+                                                        side = 0  # BUY to flatten short
+                                                except Exception:
+                                                    pass
+                                                if side is None:
+                                                    s = p.get("side")
+                                                    if s in (0, 1):
+                                                        side = 1 - int(s)
+                                                if side is None:
+                                                    continue
+                                                api_post(tok, "/api/Order/place", {
+                                                    "accountId": ACCOUNT_ID,
+                                                    "contractId": contract_id,
+                                                    "type": 2,
+                                                    "side": int(side),
+                                                    "size": int(q),
+                                                })
+                                            except Exception:
+                                                continue
+                                    except Exception:
+                                        pass
+                                    logging.info("Flattened orders/positions at hour %02d boundary (%s)", hh, tzname)
+                                else:
+                                    logging.warning("Hour boundary flatten: no token available")
+                            except Exception:
+                                logging.exception("Hour boundary flatten failed")
+                    last_hour = hh
+            except Exception:
+                pass
+            time.sleep(5.0)
+
+    threading.Thread(target=hour_boundary_watchdog, daemon=True).start()
+
+    # Connection watchdog: auto-reboot on prolonged disconnect/idle
+    def connection_watchdog():
+        runtime = config.get('runtime') or {}
+        auto_reboot = bool(runtime.get('auto_reboot_on_disconnect', True))
+        if not auto_reboot:
+            return
+        try:
+            startup_grace = float(runtime.get('connection_startup_grace_sec', 120) or 120)
+        except Exception:
+            startup_grace = 120.0
+        try:
+            idle_limit = float(runtime.get('connection_idle_reboot_sec', 180) or 180)
+        except Exception:
+            idle_limit = 180.0
+        try:
+            disconnect_limit = float(runtime.get('connection_disconnected_reboot_sec', 60) or 60)
+        except Exception:
+            disconnect_limit = 60.0
+        reboot_only_when_flat = bool(runtime.get('reboot_only_when_flat', False))
+        while True:
+            try:
+                now = time.time()
+                start_ts = float(ctx.get('START_TS') or now)
+                last_evt = float(ctx.get('last_stream_event_ts') or 0.0)
+                connected = bool(ctx.get('STREAM_CONNECTED'))
+                # Respect startup grace window
+                if (now - start_ts) < startup_grace:
+                    time.sleep(5.0)
+                    continue
+                # If explicitly disconnected and idle beyond disconnect_limit, reboot
+                if (not connected) and (now - max(last_evt, start_ts) >= disconnect_limit):
+                    if reboot_only_when_flat:
+                        try:
+                            tok = get_token()
+                            if tok:
+                                pres = api_post(tok, "/api/Position/searchOpen", {"accountId": ACCOUNT_ID})
+                                plist = pres.get("positions") if isinstance(pres, dict) else (pres if isinstance(pres, list) else [])
+                                busy = False
+                                for p in plist or []:
+                                    try:
+                                        q = p.get("quantity") or p.get("qty") or p.get("size")
+                                        if q is not None and float(q) != 0.0:
+                                            busy = True; break
+                                    except Exception:
+                                        continue
+                                if busy:
+                                    logging.warning("Disconnect watchdog: in a trade; defer reboot (only_when_flat)")
+                                    time.sleep(5.0)
+                                    continue
+                        except Exception:
+                            pass
+                    logging.error("Market stream disconnected for %.0fs; rebooting strategy process", disconnect_limit)
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                # If connected but no events beyond idle_limit, reboot (covers stalled stream/token expiry)
+                if (now - max(last_evt, start_ts)) >= idle_limit:
+                    if reboot_only_when_flat:
+                        try:
+                            tok = get_token()
+                            if tok:
+                                pres = api_post(tok, "/api/Position/searchOpen", {"accountId": ACCOUNT_ID})
+                                plist = pres.get("positions") if isinstance(pres, dict) else (pres if isinstance(pres, list) else [])
+                                busy = False
+                                for p in plist or []:
+                                    try:
+                                        q = p.get("quantity") or p.get("qty") or p.get("size")
+                                        if q is not None and float(q) != 0.0:
+                                            busy = True; break
+                                    except Exception:
+                                        continue
+                                if busy:
+                                    logging.warning("Idle watchdog: in a trade; defer reboot (only_when_flat)")
+                                    time.sleep(5.0)
+                                    continue
+                        except Exception:
+                            pass
+                    logging.error("No market stream events for %.0fs; rebooting strategy process", idle_limit)
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception:
+                # Avoid watchdog death; keep checking
+                pass
+            time.sleep(5.0)
+
+    threading.Thread(target=connection_watchdog, daemon=True).start()
 
     # Start streaming in foreground thread
     run_stream()
