@@ -3,7 +3,9 @@ import requests, json, sys, yaml
 from pathlib import Path
 
 BASE = "https://api.topstepx.com"
-CFG  = Path("config.yaml")
+# Resolve config.yaml relative to this script's directory so it works
+# regardless of the caller's current working directory.
+CFG  = Path(__file__).resolve().parent / "config.yaml"
 
 def load_cfg():
     if not CFG.exists():
