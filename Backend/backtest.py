@@ -12,7 +12,7 @@ import pandas as pd
 from topstepx_bot.api import get_token as _api_get_token, api_post as _api_post
 from topstepx_bot.indicators import ATR, compute_indicators
 from topstepx_bot.utils import snap_to_tick
-# Backend/.venv/bin/python Backend/backtest.py --symbol MNQ --days 13 --commission 0.37 --native-trailing --trail-ticks 4 --trail-offset-ticks 8 --slippage-ticks 1 --exit-sec --plot-equity Backend/equity.png --export-csv Backend/trades_export.csv --print-count 50
+# Backend/.venv/bin/python Backend/backtest.py --symbol MNQ --days 2 --commission 0.37 --native-trailing --trail-ticks 4 --trail-offset-ticks 8 --slippage-ticks 1 --exit-sec --export-csv Backend/trades_export.csv --print-count 50
 
 #Backend/.venv/bin/python Backend/backtest.py --symbol MNQ --days 2 --commission 0.74 --native-trailing --trail-ticks 4 --trail-offset-ticks 8 --slippage-ticks 1
 
@@ -322,6 +322,8 @@ def backtest_week(
     # Tick-level simulation
     ticks: Optional[pd.DataFrame] = None,
     slippage_ticks: int = 0,
+    # Fixed bid/ask spread to model (points). Applied as half-spread on entry and exit.
+    spread_points: float = 0.0,
     # 1-second exit logic
     sec_bars: Optional[pd.DataFrame] = None,
     exit_on_sec: bool = False,
@@ -381,7 +383,17 @@ def backtest_week(
                     if k in row and not pd.isna(row[k]):
                         ev[k] = float(row[k])
                 lst.append(ev)
-            ticks_by_bucket[pd.Timestamp(bucket, tz="UTC")] = lst
+            # Ensure UTC-aware key without passing tz when already tz-aware
+            try:
+                key = pd.Timestamp(bucket)
+                if getattr(key, 'tzinfo', None) is None:
+                    key = key.tz_localize("UTC")
+                else:
+                    key = key.tz_convert("UTC")
+            except Exception:
+                # Fallback: store as-is
+                key = bucket
+            ticks_by_bucket[key] = lst
 
     def _apply_slippage(px: float, side: str, kind: str) -> float:
         """Apply adverse slippage in ticks depending on fill kind.
@@ -404,6 +416,25 @@ def backtest_week(
                 return px + slip  # worse stop
             else:  # target
                 return px + slip  # worse target
+
+    def _apply_half_spread(px: float, side: str, action: str) -> float:
+        """Apply half of the configured spread to a fill price.
+        action: 'entry' or 'exit'. For both, if the action is a sell (long exit or short entry),
+        subtract half-spread; if buy (long entry or short exit), add half-spread.
+        """
+        sp = float(spread_points or 0.0)
+        if sp <= 0:
+            return px
+        # Determine if this action is a buy or sell
+        is_buy = None
+        if action == "entry":
+            is_buy = (side == "long")
+        else:  # exit
+            is_buy = (side == "short")
+        if is_buy:
+            return px + (sp * 0.5)
+        else:
+            return px - (sp * 0.5)
 
     for idx in range(1, len(ind)):
         ts = ind.index[idx]
@@ -465,7 +496,9 @@ def backtest_week(
                         entry_px_src = float(open_px)
                     if entry_px_src is None:
                         raise RuntimeError("No tick/open price available for entry fill")
-                    entry_px = snap_to_tick(entry_px_src, tick_size, price_decimals)
+                    # Apply fixed half-spread (buy at ask, sell at bid) then slippage
+                    entry_px_adj = _apply_half_spread(float(entry_px_src), side, action="entry")
+                    entry_px = snap_to_tick(entry_px_adj, tick_size, price_decimals)
                     entry_px = _apply_slippage(entry_px, side, kind="entry")
                     if side == "long":
                         sl_px = snap_to_tick(entry_px - stop_pts, tick_size, price_decimals)
@@ -654,23 +687,25 @@ def backtest_week(
                         # For stop market sells, use bid if available
                         if (pos.sl is not None) and (((px_i is not None) and (px_i <= pos.sl)) or (cur_bid is not None and cur_bid <= pos.sl)):
                             base_px = cur_bid if cur_bid is not None else (px_i if px_i is not None else pos.sl)
-                            exit_price = _apply_slippage(float(base_px), pos.side, kind="stop")
+                            ep = _apply_slippage(float(base_px), pos.side, kind="stop")
+                            exit_price = _apply_half_spread(ep, pos.side, action="exit")
                             exit_reason = "SL"
                             break
                         if (pos.tp is not None) and (((px_i is not None) and (px_i >= pos.tp)) or (cur_bid is not None and cur_bid >= pos.tp)):
-                            # For sell limit TP, fill at limit price conservatively
-                            exit_price = float(pos.tp)
+                            # For sell limit TP, fill at limit price conservatively, less half-spread
+                            exit_price = _apply_half_spread(float(pos.tp), pos.side, action="exit")
                             exit_reason = "TP"
                             break
                     else:
                         if (pos.sl is not None) and (((px_i is not None) and (px_i >= pos.sl)) or (cur_ask is not None and cur_ask >= pos.sl)):
                             base_px = cur_ask if cur_ask is not None else (px_i if px_i is not None else pos.sl)
-                            exit_price = _apply_slippage(float(base_px), pos.side, kind="stop")
+                            ep = _apply_slippage(float(base_px), pos.side, kind="stop")
+                            exit_price = _apply_half_spread(ep, pos.side, action="exit")
                             exit_reason = "SL"
                             break
                         if (pos.tp is not None) and (((px_i is not None) and (px_i <= pos.tp)) or (cur_ask is not None and cur_ask <= pos.tp)):
-                            # For buy limit TP, fill at limit price
-                            exit_price = float(pos.tp)
+                            # For buy limit TP, fill at limit price plus half-spread
+                            exit_price = _apply_half_spread(float(pos.tp), pos.side, action="exit")
                             exit_reason = "TP"
                             break
             else:
@@ -718,20 +753,22 @@ def backtest_week(
                                 # SL/TP checks on 1-second bar
                                 if pos.side == "long":
                                     if (pos.sl is not None) and (s_low is not None) and (s_low <= pos.sl):
-                                        exit_price = _apply_slippage(float(pos.sl), pos.side, kind="stop")
+                                        ep = _apply_slippage(float(pos.sl), pos.side, kind="stop")
+                                        exit_price = _apply_half_spread(ep, pos.side, action="exit")
                                         exit_reason = "SL"
                                         break
                                     if (pos.tp is not None) and (s_high is not None) and (s_high >= pos.tp):
-                                        exit_price = float(pos.tp)
+                                        exit_price = _apply_half_spread(float(pos.tp), pos.side, action="exit")
                                         exit_reason = "TP"
                                         break
                                 else:
                                     if (pos.sl is not None) and (s_high is not None) and (s_high >= pos.sl):
-                                        exit_price = _apply_slippage(float(pos.sl), pos.side, kind="stop")
+                                        ep = _apply_slippage(float(pos.sl), pos.side, kind="stop")
+                                        exit_price = _apply_half_spread(ep, pos.side, action="exit")
                                         exit_reason = "SL"
                                         break
                                     if (pos.tp is not None) and (s_low is not None) and (s_low <= pos.tp):
-                                        exit_price = float(pos.tp)
+                                        exit_price = _apply_half_spread(float(pos.tp), pos.side, action="exit")
                                         exit_reason = "TP"
                                         break
                     except Exception:
@@ -740,17 +777,17 @@ def backtest_week(
                     # Conservative bar-level ordering (minute or main bar timeframe)
                     if pos.side == "long":
                         if (low_px is not None) and (pos.sl is not None) and (low_px <= pos.sl):
-                            exit_price = float(pos.sl)
+                            exit_price = _apply_half_spread(float(pos.sl), pos.side, action="exit")
                             exit_reason = "SL"
                         elif (high_px is not None) and (pos.tp is not None) and (high_px >= pos.tp):
-                            exit_price = float(pos.tp)
+                            exit_price = _apply_half_spread(float(pos.tp), pos.side, action="exit")
                             exit_reason = "TP"
                     else:  # short
                         if (high_px is not None) and (pos.sl is not None) and (high_px >= pos.sl):
-                            exit_price = float(pos.sl)
+                            exit_price = _apply_half_spread(float(pos.sl), pos.side, action="exit")
                             exit_reason = "SL"
                         elif (low_px is not None) and (pos.tp is not None) and (low_px <= pos.tp):
-                            exit_price = float(pos.tp)
+                            exit_price = _apply_half_spread(float(pos.tp), pos.side, action="exit")
                             exit_reason = "TP"
 
             # If neither bracket hit and reverse-on-cross, flatten at close when opposite signal fires
@@ -770,7 +807,7 @@ def backtest_week(
                     will_reverse = True
 
             if (exit_price is None) and will_reverse:
-                exit_price = float(close_px)
+                exit_price = _apply_half_spread(float(close_px), pos.side, action="exit")
                 exit_reason = "REVERSE"
 
             if exit_price is not None:
@@ -836,7 +873,9 @@ def backtest_week(
         last_ts = ind.index[-1]
         last_close = float(ind.iloc[-1]["close"]) if not pd.isna(ind.iloc[-1].get("close")) else None
         if last_close is not None:
-            pos.exit = snap_to_tick(float(last_close), tick_size, price_decimals)
+            # Apply fixed spread to final liquidation as a sell (long) or buy (short)
+            last_exit_px = _apply_half_spread(float(last_close), pos.side, action="exit")
+            pos.exit = snap_to_tick(float(last_exit_px), tick_size, price_decimals)
             pos.exit_comm = float(commission_per_contract_side) * float(pos.size)
             points = (pos.exit - pos.entry) * (1.0 if pos.side == "long" else -1.0)
             gross = float(points) * float(risk_per_point) * float(pos.size)
@@ -882,6 +921,7 @@ def main():
     ap.add_argument("--tz", type=str, default=None, help="Timezone for calculations/prints (default config.tz or America/New_York)")
     ap.add_argument("--ticks", type=str, default=None, help="Path to JSONL ticks file recorded via tools/record_ticks.py")
     ap.add_argument("--slippage-ticks", type=int, default=0, help="Adverse slippage in ticks applied to fills")
+    ap.add_argument("--spread-points", type=float, default=0.0, help="Fixed bid/ask spread in points (applies half at entry/exit)")
     ap.add_argument("--sec-bars", action="store_true", help="Use 1-second bars for indicators (from ticks if provided, else API)")
     ap.add_argument("--exit-sec", action="store_true", help="Use 1-second bars (or ticks) for exit logic while keeping entries/signals on main bars")
     ap.add_argument("--csv", type=str, default=None, help="Path to CSV file with either OHLCV bars or tick data (auto-detected)")
@@ -1048,6 +1088,7 @@ def main():
         rth_only=bool(args.rth_only),
         ticks=ticks_df,
         slippage_ticks=int(args.slippage_ticks or 0),
+        spread_points=float(args.spread_points or 0.0),
         sec_bars=sec_bars,
         exit_on_sec=bool(args.exit_sec),
     )

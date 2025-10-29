@@ -74,6 +74,33 @@ class MarketStreamer:
             return False
         return False
 
+    def _position_qty_sign(self) -> int:
+        """Return +1 if net long, -1 if net short, 0 if flat or unavailable for this contract."""
+        try:
+            token = self.ctx['get_token']()
+            if not token:
+                return 0
+            resp = self.ctx['api_post'](token, "/api/Position/searchOpen", {"accountId": self.ctx['ACCOUNT_ID']})
+            pos_list = resp.get("positions") if isinstance(resp, dict) else (resp if isinstance(resp, list) else [])
+            for p in pos_list or []:
+                try:
+                    cid = p.get("contractId") or (p.get("contract") or {}).get("id")
+                    if cid != self.contract_id:
+                        continue
+                    qty = p.get("quantity") or p.get("qty") or p.get("size")
+                    if qty is None:
+                        continue
+                    q = float(qty)
+                    if q > 0:
+                        return 1
+                    if q < 0:
+                        return -1
+                except Exception:
+                    continue
+        except Exception:
+            return 0
+        return 0
+
     def _flatten_and_cancel(self) -> None:
         try:
             token = self.ctx['get_token']()
@@ -544,6 +571,17 @@ class MarketStreamer:
 
     def _place_market_with_brackets(self, side: int, op: float, atr_val: float):
         """Place a market entry and immediately attach a native trailing stop."""
+        # Safety: always attempt to cancel open orders and flatten any position
+        # before placing a fresh entry when enabled in context. This guards
+        # against sticky orders/positions on the venue.
+        try:
+            if bool(self.ctx.get('ALWAYS_FLATTEN_BEFORE_ENTRY', False)):
+                ok = self._ensure_flat_and_cleared(timeout_sec=5.0)
+                if not ok:
+                    logging.info("Pre-entry flatten/cancel did not complete; skip new entry")
+                    return
+        except Exception:
+            pass
         token = self.ctx['get_token']()
         if not token:
             logging.error("Auto-trade auth failed")
@@ -572,6 +610,27 @@ class MarketStreamer:
                 if size < 1:
                     logging.info("Skip auto-entry (synth): size < 1 | stop_pts=%.4f $/pt=%.4f risk=%.2f", stop_points, rp, risk_dollars)
                     return
+                # Daily contracts limit gate (if configured)
+                try:
+                    max_day = int(self.ctx.get('MAX_CONTRACTS_PER_DAY') or 0)
+                except Exception:
+                    max_day = 0
+                if max_day and max_day > 0:
+                    try:
+                        import datetime as dt
+                        from zoneinfo import ZoneInfo
+                        tzname = self.ctx.get('TZ') or 'UTC'
+                        day_key = dt.datetime.now(ZoneInfo(tzname)).date().isoformat()
+                    except Exception:
+                        day_key = time.strftime('%Y-%m-%d')
+                    cur_key = self.ctx.get('contracts_day_key')
+                    if cur_key != day_key:
+                        self.ctx['contracts_day_key'] = day_key
+                        self.ctx['contracts_traded_today'] = 0
+                    used = int(self.ctx.get('contracts_traded_today') or 0)
+                    if (used + int(size)) > int(max_day):
+                        logging.info("Daily contracts limit reached (%d/%d); skipping entry", used, max_day)
+                        return
                 entry_payload = {
                     "accountId": self.ctx['ACCOUNT_ID'],
                     "contractId": self.contract_id,
@@ -584,6 +643,11 @@ class MarketStreamer:
                 if not entry.get("success") or not entry.get("orderId"):
                     logging.error("Auto entry (synth) failed: %s", entry)
                     return
+                # increment daily contracts counter on success
+                try:
+                    self.ctx['contracts_traded_today'] = int(self.ctx.get('contracts_traded_today') or 0) + int(size)
+                except Exception:
+                    pass
                 entry_id = entry.get("orderId")
                 # Compute Pine-matching TP distances
                 if side == 0:
@@ -678,6 +742,27 @@ class MarketStreamer:
             )
             return
 
+        # Daily contracts limit gate (if configured)
+        try:
+            max_day = int(self.ctx.get('MAX_CONTRACTS_PER_DAY') or 0)
+        except Exception:
+            max_day = 0
+        if max_day and max_day > 0:
+            try:
+                import datetime as dt
+                from zoneinfo import ZoneInfo
+                tzname = self.ctx.get('TZ') or 'UTC'
+                day_key = dt.datetime.now(ZoneInfo(tzname)).date().isoformat()
+            except Exception:
+                day_key = time.strftime('%Y-%m-%d')
+            cur_key = self.ctx.get('contracts_day_key')
+            if cur_key != day_key:
+                self.ctx['contracts_day_key'] = day_key
+                self.ctx['contracts_traded_today'] = 0
+            used = int(self.ctx.get('contracts_traded_today') or 0)
+            if (used + int(size)) > int(max_day):
+                logging.info("Daily contracts limit reached (%d/%d); skipping entry", used, max_day)
+                return
         entry_payload = {
             "accountId": self.ctx['ACCOUNT_ID'],
             "contractId": self.contract_id,
@@ -707,6 +792,11 @@ class MarketStreamer:
 
         entry_id = entry.get("orderId")
         logging.info("Market entry placed: id=%s side=%s size=%d trail_ticks=%d", str(entry_id), "BUY" if side == 0 else "SELL", int(size), int(trail_ticks_cfg))
+        # increment daily contracts counter on success
+        try:
+            self.ctx['contracts_traded_today'] = int(self.ctx.get('contracts_traded_today') or 0) + int(size)
+        except Exception:
+            pass
 
         # Place the native trailing stop (type 5)
         sl_order = None
@@ -923,6 +1013,42 @@ class MarketStreamer:
                     except Exception:
                         pass
                     oc = self.ctx['get_open_orders_count'](self.contract_id)
+                    pos_s = self._position_qty_sign()
+                    # No stacking: block adds in same direction
+                    if cross_up and pos_s > 0:
+                        return
+                    if cross_dn and pos_s < 0:
+                        return
+                    # Reverse handling: if opposite pos or open orders exist, flatten/cancel when enabled
+                    if cross_up and bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s < 0)):
+                        if not self._ensure_flat_and_cleared():
+                            return
+                        oc = self.ctx['get_open_orders_count'](self.contract_id)
+                        try:
+                            delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
+                        except Exception:
+                            delay = 0.0
+                        if delay > 0:
+                            try:
+                                self._reverse_guard_until = time.time() + delay
+                            except Exception:
+                                pass
+                            return
+                    if cross_dn and (not self.ctx['LONG_ONLY']) and bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s > 0)):
+                        if not self._ensure_flat_and_cleared():
+                            return
+                        oc = self.ctx['get_open_orders_count'](self.contract_id)
+                        try:
+                            delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
+                        except Exception:
+                            delay = 0.0
+                        if delay > 0:
+                            try:
+                                self._reverse_guard_until = time.time() + delay
+                            except Exception:
+                                pass
+                            return
+                    # Block if any open orders remain after checks
                     if oc > 0:
                         return
                     self._last_intrabar_minute = self.cur_minute

@@ -84,6 +84,30 @@ def load_config() -> Dict[str, Any]:
     return data
 
 
+def _resolve_account_id(cfg: Dict[str, Any]) -> int:
+    """Resolve account_id from several common locations in config.yaml.
+    Preference order:
+      1) top-level account_id
+      2) account.id (object)
+      3) auth.account_id
+      4) topstepx.account_id
+    Returns 0 if none found or not coercible to int.
+    """
+    candidates = [
+        cfg.get("account_id"),
+        (cfg.get("account") or {}).get("id"),
+        (cfg.get("auth") or {}).get("account_id"),
+        (cfg.get("topstepx") or {}).get("account_id"),
+    ]
+    for c in candidates:
+        try:
+            if c is not None:
+                return int(c)
+        except Exception:
+            continue
+    return 0
+
+
 class PineMarketStreamer(MarketStreamer):
     """
     Pine-style strategy mapping for MNQ:
@@ -159,11 +183,32 @@ class PineMarketStreamer(MarketStreamer):
                 self._last_rel = rel
                 return
 
-        # Entry decisions with reverse safety
+        # Entry decisions with no-stacking and reverse-on-cross safety
+        pos_s = self._position_qty_sign()
         if cross_up and vwap_long_ok and ema_long_ok:
-            # Always preflight-cancel/flatten before any new entry if enabled
-            if bool(self.ctx.get('ALWAYS_FLATTEN_BEFORE_ENTRY', True)):
-                if not self._ensure_flat_and_cleared(timeout_sec=5.0):
+            # Do not add to an existing long
+            if pos_s > 0:
+                logging.info("Skip LONG: already long position present")
+                self._last_rel = rel
+                return
+            # If currently short or have open orders, flatten/cancel first when reversing is enabled
+            if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s < 0)):
+                if not self._ensure_flat_and_cleared():
+                    logging.info("Reverse: not flat/clear yet; skipping LONG entry on cross")
+                    self._last_rel = rel
+                    return
+                oc = self.ctx['get_open_orders_count'](self.contract_id)
+                # Optional post-flatten delay to avoid overlapping entry with cancels
+                try:
+                    delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
+                except Exception:
+                    delay = 0.0
+                if delay > 0:
+                    try:
+                        self._reverse_guard_until = time.time() + delay
+                    except Exception:
+                        pass
+                    logging.info("Reverse: delaying new LONG entry by %.2fs after flatten", delay)
                     self._last_rel = rel
                     return
             self._last_signal_ts = now
@@ -172,8 +217,29 @@ class PineMarketStreamer(MarketStreamer):
             return
 
         if (not self.ctx['LONG_ONLY']) and cross_dn and vwap_short_ok and ema_short_ok:
-            if bool(self.ctx.get('ALWAYS_FLATTEN_BEFORE_ENTRY', True)):
-                if not self._ensure_flat_and_cleared(timeout_sec=5.0):
+            # Do not add to an existing short
+            if pos_s < 0:
+                logging.info("Skip SHORT: already short position present")
+                self._last_rel = rel
+                return
+            # If currently long or have open orders, flatten/cancel first when reversing is enabled
+            if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s > 0)):
+                if not self._ensure_flat_and_cleared():
+                    logging.info("Reverse: not flat/clear yet; skipping SHORT entry on cross")
+                    self._last_rel = rel
+                    return
+                oc = self.ctx['get_open_orders_count'](self.contract_id)
+                # Optional post-flatten delay to avoid overlapping entry with cancels
+                try:
+                    delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
+                except Exception:
+                    delay = 0.0
+                if delay > 0:
+                    try:
+                        self._reverse_guard_until = time.time() + delay
+                    except Exception:
+                        pass
+                    logging.info("Reverse: delaying new SHORT entry by %.2fs after flatten", delay)
                     self._last_rel = rel
                     return
             self._last_signal_ts = now
@@ -346,6 +412,27 @@ class PineMarketStreamer(MarketStreamer):
         if size < 1:
             logging.info("Skip entry: size < 1 (risk=$%.2f, rp=%.2f, stop_pts=%.4f)", risk_dollars, rp, stop_pts)
             return
+        # Daily contracts limit gate (if configured)
+        try:
+            max_day = int(self.ctx.get('MAX_CONTRACTS_PER_DAY') or 0)
+        except Exception:
+            max_day = 0
+        if max_day and max_day > 0:
+            try:
+                import datetime as dt
+                from zoneinfo import ZoneInfo
+                tzname = self.ctx.get('TZ') or 'UTC'
+                day_key = dt.datetime.now(ZoneInfo(tzname)).date().isoformat()
+            except Exception:
+                day_key = time.strftime('%Y-%m-%d')
+            cur_key = self.ctx.get('contracts_day_key')
+            if cur_key != day_key:
+                self.ctx['contracts_day_key'] = day_key
+                self.ctx['contracts_traded_today'] = 0
+            used = int(self.ctx.get('contracts_traded_today') or 0)
+            if (used + int(size)) > int(max_day):
+                logging.info("Daily contracts limit reached (%d/%d); skipping entry", used, max_day)
+                return
 
         # Entry market order
         entry_payload = {
@@ -358,10 +445,25 @@ class PineMarketStreamer(MarketStreamer):
         }
         entry = self.ctx['api_post'](token, "/api/Order/place", entry_payload)
         if not entry.get("success") or not entry.get("orderId"):
-            logging.error("Entry failed: %s", entry)
+            try:
+                logging.error(
+                    "Entry failed (acct=%s cid=%s side=%s size=%s): %s",
+                    str(self.ctx.get('ACCOUNT_ID')),
+                    str(self.contract_id),
+                    str(side),
+                    str(size),
+                    entry,
+                )
+            except Exception:
+                logging.error("Entry failed: %s", entry)
             return
         entry_id = entry.get("orderId")
         logging.info("Pine entry placed id=%s side=%s size=%d", str(entry_id), "BUY" if side==0 else "SELL", int(size))
+        # increment daily contracts counter on success
+        try:
+            self.ctx['contracts_traded_today'] = int(self.ctx.get('contracts_traded_today') or 0) + int(size)
+        except Exception:
+            pass
 
         # Compute TP and SL prices (snap to tick)
         if side == 0:
@@ -506,12 +608,13 @@ def run_strategy_server():
     AUTH = config.get("auth", {}) or {}
     USERNAME = config.get("username") or AUTH.get("username") or AUTH.get("email") or ""
     API_KEY = config.get("api_key") or AUTH.get("api_key") or ""
-    ACCOUNT_ID = int(config.get("account_id") or (config.get("account") or {}).get("id") or 0)
+    ACCOUNT_ID = _resolve_account_id(config)
     SYMBOL = (config.get("symbol") or "MNQ").upper()
     MARKET_HUB = config.get("market_hub") or "https://rtc.topstepx.com/hubs/market"
     LIVE_FLAG = bool((config.get("market") or {}).get("live", True))
     INCLUDE_PARTIAL = bool((config.get("market") or {}).get("includePartialBar", True))
     BOOTSTRAP_HISTORY_HOURS = int(config.get("bootstrap_history_hours", 3) or 3)
+    logging.info("Config resolved: account_id=%s symbol=%s", str(ACCOUNT_ID), SYMBOL)
 
     # Strategy params (mirror Pine defaults)
     STRAT = (config.get("strategy") or {})
@@ -666,6 +769,8 @@ def run_strategy_server():
         'MAX_WEEKLY_LOSS': MAX_WEEKLY_LOSS,
         'WEEKLY_KILL_ACTIVE': False,
         'RISK_PER_TRADE': RISK_PER_TRADE,
+        # Cap total contracts entered per day (sum of entry sizes). 0/None disables.
+        'MAX_CONTRACTS_PER_DAY': int(((config.get('risk') or {}).get('daily_contracts_limit')) or ((config.get('risk') or {}).get('max_contracts_per_day')) or 0),
         # Reverse behavior: on a new opposite cross, flatten/cancel and take new signal
         'REVERSE_ON_CROSS': bool(STRAT.get('reverseOnCross', True)),
         # Always preflight cancel all open orders (account-wide) and flatten any open

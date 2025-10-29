@@ -64,6 +64,20 @@ Tips:
 - Use `--export-csv Backend/trades_export.csv` and `--plot-equity Backend/equity.png` to save outputs.
 - Daily PnL prints at the end of a run.
 
+FTMO NASDAQ 100 (US100) backtest from your own data:
+
+```bash
+python Backend/backtest_ftmo_us100.py \
+  --csv /path/to/us100_bars.csv \
+  --tick-size 1.0 --price-decimals 1 --risk-per-point 1.0 \
+  --spread-points 2.2 --commission 0.0 --slippage-ticks 0 \
+  --ema-short 9 --ema-long 21 --atr-length 14 --exit-sec
+```
+
+Notes:
+- Provide either `--csv` (bars or ticks CSV) or `--ticks` (JSONL ticks). API fetch is not used for FTMO.
+- Tune `--tick-size`, `--price-decimals`, and `--risk-per-point` to match your FTMO platform.
+
 ## 6) Common config toggles (in `Backend/config.yaml`)
 
 - `strategy.confirmBars`: 1–3 to reduce chopped crosses.
@@ -78,4 +92,3 @@ Tips:
 - Start on a test or evaluation account first.
 - Verify credentials and symbol mapping, and watch logs for API errors.
 - Ensure your system time/zone is set correctly and matches your expectations for trading hours.
-
