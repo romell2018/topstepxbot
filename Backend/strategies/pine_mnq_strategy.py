@@ -18,7 +18,7 @@ except Exception:
     yaml = None
 
 from topstepx_bot.utils import snap_to_tick, fmt_num
-from topstepx_bot.indicators import ATR as _ATR, compute_indicators as _compute_indicators
+from topstepx_bot.indicators import compute_indicators as _compute_indicators
 from topstepx_bot.api import (
     get_token as _api_get_token,
     api_post as _api_post,
@@ -158,6 +158,9 @@ class PineMarketStreamer(MarketStreamer):
         rel = ef - es
         prev_rel = self._last_rel
         cross_up, cross_dn = self._calc_cross(prev_rel, rel, bool(self.ctx.get('STRICT_CROSS_ONLY')))
+        # Optional override: force LONG cross-up for testing
+        if bool(self.ctx.get('FORCE_CROSS_UP', False)):
+            cross_up, cross_dn = True, False
 
         vwap_long_ok = True
         vwap_short_ok = True
@@ -168,6 +171,41 @@ class PineMarketStreamer(MarketStreamer):
         ema_short_ok = (not self.ctx['REQUIRE_PRICE_ABOVE_EMAS']) or (close_px <= ef and close_px <= es)
 
         oc = self.ctx['get_open_orders_count'](self.contract_id)
+
+        # If a new opposite cross forms, flatten immediately (cancel orders and close position)
+        try:
+            pos_now = self._position_qty_sign()
+        except Exception:
+            pos_now = 0
+        if cross_up and (pos_now < 0):
+            logging.info("Opposite cross (UP) while short; flattening existing position")
+            try:
+                self._flatten_and_cancel()
+            except Exception:
+                pass
+            # Optional small guard to let venue settle after flatten
+            try:
+                delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
+                if delay > 0:
+                    self._reverse_guard_until = time.time() + delay
+            except Exception:
+                pass
+            self._last_rel = rel
+            return
+        if (not self.ctx['LONG_ONLY']) and cross_dn and (pos_now > 0):
+            logging.info("Opposite cross (DOWN) while long; flattening existing position")
+            try:
+                self._flatten_and_cancel()
+            except Exception:
+                pass
+            try:
+                delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
+                if delay > 0:
+                    self._reverse_guard_until = time.time() + delay
+            except Exception:
+                pass
+            self._last_rel = rel
+            return
         if (now - float(getattr(self, '_last_signal_ts', 0.0))) < float(self.ctx.get('TRADE_COOLDOWN_SEC', 0)):
             self._last_rel = rel
             return
@@ -191,6 +229,11 @@ class PineMarketStreamer(MarketStreamer):
                 logging.info("Skip LONG: already long position present")
                 self._last_rel = rel
                 return
+            # Always preflight: cancel open orders and flatten any position before a new entry
+            try:
+                self._flatten_and_cancel()
+            except Exception:
+                pass
             # If currently short or have open orders, flatten/cancel first when reversing is enabled
             if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s < 0)):
                 if not self._ensure_flat_and_cleared():
@@ -222,6 +265,11 @@ class PineMarketStreamer(MarketStreamer):
                 logging.info("Skip SHORT: already short position present")
                 self._last_rel = rel
                 return
+            # Always preflight: cancel open orders and flatten any position before a new entry
+            try:
+                self._flatten_and_cancel()
+            except Exception:
+                pass
             # If currently long or have open orders, flatten/cancel first when reversing is enabled
             if bool(self.ctx.get('REVERSE_ON_CROSS', True)) and ((oc > 0) or (pos_s > 0)):
                 if not self._ensure_flat_and_cleared():
@@ -391,11 +439,16 @@ class PineMarketStreamer(MarketStreamer):
         decimals = int(cm.get("decimalPlaces") or 2)
 
         # Pine stop/targets in price points
-        stop_long_pts = float(atr_val) * 2.0
-        stop_short_pts = float(atr_val) * 1.5
-        trail_long_pts = float(atr_val) * float(self.ctx.get('ATR_TRAIL_K_LONG', 0.5) or 0.5)
-        trail_short_pts = float(atr_val) * float(self.ctx.get('ATR_TRAIL_K_SHORT', 0.5) or 0.5)
-        trail_offset_pts = float(atr_val) * 0.3
+        stop_long_pts   = float(atr_val) * 2.0
+        stop_short_pts  = float(atr_val) * 1.5
+
+        # Trailing config (price points) from ctx (defaults set in ctx earlier)
+        trail_long_pts  = float(atr_val) * float(self.ctx.get('ATR_TRAIL_K_LONG', 1.5) or 1.5)
+        trail_short_pts = float(atr_val) * float(self.ctx.get('ATR_TRAIL_K_SHORT', 1.0) or 1.0)
+
+        # Activation offsets (price points)
+        trail_offset_pts_long  = float(atr_val) * float(self.ctx.get('TRAIL_OFFSET_K_LONG', 0.5) or 0.5)
+        trail_offset_pts_short = float(atr_val) * float(self.ctx.get('TRAIL_OFFSET_K_SHORT', 0.5) or 0.5)
 
         # Risk-based sizing per Pine
         rp = self.ctx['risk_per_point'](self.symbol, self.contract_id)
@@ -469,90 +522,139 @@ class PineMarketStreamer(MarketStreamer):
         if side == 0:
             sl_px_fixed = snap_to_tick(op - stop_long_pts, tick_size, decimals)
             tp_px = snap_to_tick(op + stop_long_pts * 3.0, tick_size, decimals)
-            t_points = trail_long_pts
         else:
             sl_px_fixed = snap_to_tick(op + stop_short_pts, tick_size, decimals)
             tp_px = snap_to_tick(op - stop_short_pts * 2.0, tick_size, decimals)
-            t_points = trail_short_pts
 
-        # Place STOP first (safer if side limits are tight); retry once on failure
-        sl_id = None
-        sl_resp = self.ctx['api_post'](token, "/api/Order/place", {
-            "accountId": self.ctx['ACCOUNT_ID'],
-            "contractId": self.contract_id,
-            "type": 4,
-            "side": 1 - side,
-            "size": int(size),
-            "stopPrice": sl_px_fixed,
-            "linkedOrderId": entry_id,
-        })
-        if sl_resp.get("success") and sl_resp.get("orderId"):
-            sl_id = sl_resp.get("orderId")
-            logging.info("Pine SL placed id=%s price=%.4f", str(sl_id), float(sl_px_fixed))
+        # Convert trail distance + offset to TICKS for the venue
+        def _to_ticks(points: float) -> Optional[int]:
+            if (not tick_size) or (tick_size <= 0):
+                return None
+            try:
+                return max(1, int(round(abs(points) / float(tick_size))))
+            except Exception:
+                return None
+
+        if side == 0:
+            trail_ticks = _to_ticks(trail_long_pts)
+            offset_ticks = _to_ticks(trail_offset_pts_long)
         else:
-            logging.warning("Pine SL placement failed for entry %s: %s", str(entry_id), sl_resp)
-            # brief retry
-            try:
-                time.sleep(0.2)
-            except Exception:
-                pass
-            sl_resp2 = self.ctx['api_post'](token, "/api/Order/place", {
-                "accountId": self.ctx['ACCOUNT_ID'],
-                "contractId": self.contract_id,
-                "type": 4,
-                "side": 1 - side,
-                "size": int(size),
-                "stopPrice": sl_px_fixed,
-                "linkedOrderId": entry_id,
-            })
-            if sl_resp2.get("success") and sl_resp2.get("orderId"):
-                sl_id = sl_resp2.get("orderId")
-                logging.info("Pine SL placed (retry) id=%s price=%.4f", str(sl_id), float(sl_px_fixed))
-            else:
-                logging.error("Pine SL retry failed for entry %s: %s", str(entry_id), sl_resp2)
+            trail_ticks = _to_ticks(trail_short_pts)
+            offset_ticks = _to_ticks(trail_offset_pts_short)
 
-        # If fixed SL could not be placed, optionally fall back to native trailing stop immediately
-        if (sl_id is None) and bool(self.ctx.get('TRAILING_STOP_ENABLED', True)):
+        # Prefer native trailing SL (ATR-derived) as the child; fallback to fixed STOP only if needed
+        sl_id = None
+        try:
+            use_native_trail = bool(self.ctx.get('TRAILING_STOP_ENABLED', True))
+        except Exception:
+            use_native_trail = True
+
+        if use_native_trail:
             try:
-                # Derive ticks: prefer fixed config; else ATR-based approximation
-                t_ticks = None
-                try:
-                    t_ticks = int(self.ctx.get('TRAIL_TICKS_FIXED')) if (self.ctx.get('TRAIL_TICKS_FIXED') is not None) else None
-                except Exception:
-                    t_ticks = None
-                if (t_ticks is None) and (tick_size and tick_size > 0):
+                # Ensure we have both trail and offset ticks
+                if trail_ticks is None:
                     t_pts = trail_long_pts if side == 0 else trail_short_pts
+                    trail_ticks = _to_ticks(t_pts)
+                # Resolve offset ticks from config first, then ATR-based offset K
+                if offset_ticks is None:
                     try:
-                        t_ticks = int(max(1, round(abs(t_pts) / float(tick_size))))
+                        off_cfg = int(self.ctx.get('TRAIL_OFFSET_TICKS_LONG')) if side == 0 else int(self.ctx.get('TRAIL_OFFSET_TICKS_SHORT'))
                     except Exception:
-                        t_ticks = None
-                if t_ticks is not None:
-                    tr = self._place_trailing_order(token, entry_id, side, size, int(t_ticks),
-                                                    entry_price=float(op), tick_size=tick_size, decimals=decimals)
-                    if tr and tr.get("success") and tr.get("orderId"):
-                        sl_id = tr.get("orderId")
-                        logging.info("Pine native TRAIL placed id=%s ticks=%s", str(sl_id), str(t_ticks))
-                        # mark native
+                        off_cfg = None
+                    if off_cfg not in (None, '', False):
                         try:
-                            self.ctx['active_entries'][entry_id] = {
-                                "symbol": self.symbol,
-                                "contractId": self.contract_id,
-                                "side": int(side),
-                                "size": int(size),
-                                "entry": float(op),
-                                "stop_points": float(trail_long_pts if side == 0 else trail_short_pts),
-                                "tp_id": None,
-                                "sl_id": sl_id,
-                                "native_trail": True,
-                                "tickSize": float(tick_size),
-                                "decimals": int(decimals),
-                            }
+                            offset_ticks = max(1, int(off_cfg))
                         except Exception:
-                            pass
-                    else:
-                        logging.error("Pine native TRAIL failed for entry %s: %s", str(entry_id), tr)
+                            offset_ticks = None
+                    if offset_ticks is None:
+                        # Use precomputed activation offsets in price points
+                        try:
+                            o_pts = trail_offset_pts_long if side == 0 else trail_offset_pts_short
+                        except Exception:
+                            # Fallback to K-based computation if locals not available
+                            try:
+                                k = float(self.ctx.get('TRAIL_OFFSET_K_LONG')) if side == 0 else float(self.ctx.get('TRAIL_OFFSET_K_SHORT'))
+                            except Exception:
+                                k = 0.0
+                            o_pts = float(atr_val) * float(k)
+                        offset_ticks = _to_ticks(o_pts)
+                # Defensive defaults
+                trail_ticks = int(trail_ticks or 1)
+                offset_ticks = int(offset_ticks or 1)
+
+                tr = self._place_trailing_order(
+                    token, entry_id, side, size,
+                    trail_ticks=int(trail_ticks),
+                    offset_ticks=int(offset_ticks),
+                    entry_price=float(op),
+                    tick_size=tick_size,
+                    decimals=decimals
+                )
+                if tr and tr.get("success") and tr.get("orderId"):
+                    sl_id = tr.get("orderId")
+                    logging.info("Pine native TRAIL placed id=%s trail=%dt offset=%dt", str(sl_id), int(trail_ticks), int(offset_ticks))
+                    # mark native
+                    try:
+                        self.ctx['active_entries'][entry_id] = {
+                            "symbol": self.symbol,
+                            "contractId": self.contract_id,
+                            "side": int(side),
+                            "size": int(size),
+                            "entry": float(op),
+                            "stop_points": float(trail_long_pts if side == 0 else trail_short_pts),
+                            "tp_id": None,
+                            "sl_id": sl_id,
+                            "native_trail": True,
+                            "tickSize": float(tick_size),
+                            "decimals": int(decimals),
+                        }
+                    except Exception:
+                        pass
+                else:
+                    logging.error("Pine native TRAIL failed for entry %s: %s", str(entry_id), tr)
             except Exception:
-                logging.exception("Error while placing native trailing fallback")
+                logging.exception("Error while placing native trailing")
+
+        # Fallback to fixed STOP if native trailing is disabled or fails and not forcing native only
+        if sl_id is None:
+            try:
+                force_native_only = bool(self.ctx.get('FORCE_NATIVE_TRAIL', False))
+            except Exception:
+                force_native_only = False
+            if not force_native_only:
+                sl_resp = self.ctx['api_post'](token, "/api/Order/place", {
+                    "accountId": self.ctx['ACCOUNT_ID'],
+                    "contractId": self.contract_id,
+                    "type": 4,
+                    "side": 1 - side,
+                    "size": int(size),
+                    "stopPrice": sl_px_fixed,
+                    "linkedOrderId": entry_id,
+                })
+                if sl_resp.get("success") and sl_resp.get("orderId"):
+                    sl_id = sl_resp.get("orderId")
+                    logging.info("Pine SL placed id=%s price=%.4f", str(sl_id), float(sl_px_fixed))
+                else:
+                    logging.warning("Pine SL placement failed for entry %s: %s", str(entry_id), sl_resp)
+                    # brief retry
+                    try:
+                        time.sleep(0.2)
+                    except Exception:
+                        pass
+                    sl_resp2 = self.ctx['api_post'](token, "/api/Order/place", {
+                        "accountId": self.ctx['ACCOUNT_ID'],
+                        "contractId": self.contract_id,
+                        "type": 4,
+                        "side": 1 - side,
+                        "size": int(size),
+                        "stopPrice": sl_px_fixed,
+                        "linkedOrderId": entry_id,
+                    })
+                    if sl_resp2.get("success") and sl_resp2.get("orderId"):
+                        sl_id = sl_resp2.get("orderId")
+                        logging.info("Pine SL placed (retry) id=%s price=%.4f", str(sl_id), float(sl_px_fixed))
+                    else:
+                        logging.error("Pine SL retry failed for entry %s: %s", str(entry_id), sl_resp2)
 
         # Place TP second (limit). Even if SL failed, TP can still be placed; OCO tracking only if both exist
         tp_id = None
@@ -596,6 +698,48 @@ class PineMarketStreamer(MarketStreamer):
                 }
             except Exception:
                 pass
+
+
+    def _place_trailing_order(self, token, parent_id, side, size, trail_ticks: int, offset_ticks: Optional[int] = None,
+                              entry_price: Optional[float] = None, tick_size: Optional[float] = None, decimals: Optional[int] = None):
+        """
+        Places a native trailing stop (type=5) with trail distance and activation offset in TICKS.
+        Some venues call these fields differently; we support a few variants via ctx['TRAIL_VARIANT'].
+        """
+        variant = str(self.ctx.get('TRAIL_VARIANT') or '').lower()
+        # Backward-compat: if offset not provided, derive from config or default to 1 tick
+        if offset_ticks in (None, '', False):
+            try:
+                off_cfg = int(self.ctx.get('TRAIL_OFFSET_TICKS_LONG')) if side == 0 else int(self.ctx.get('TRAIL_OFFSET_TICKS_SHORT'))
+            except Exception:
+                off_cfg = None
+            try:
+                offset_ticks = int(max(1, int(off_cfg))) if off_cfg not in (None, '', False) else 1
+            except Exception:
+                offset_ticks = 1
+        body = {
+            "accountId": self.ctx['ACCOUNT_ID'],
+            "contractId": self.contract_id,
+            "type": 5,             # native trailing
+            "side": 1 - int(side), # opposite of entry
+            "size": int(size),
+            "linkedOrderId": parent_id
+        }
+
+        # Map the trail fields by variant
+        # Common names we've seen: trailTicks/offsetTicks, distanceTicks/offsetTicks, trail/offset in ticks.
+        if variant in ("distance", "distanceticks", "distance_ticks"):
+            body["distanceTicks"] = int(trail_ticks)
+            body["offsetTicks"]   = int(offset_ticks)
+        elif variant in ("trail", "trailticks", "trail_ticks"):
+            body["trailTicks"]  = int(trail_ticks)
+            body["offsetTicks"] = int(offset_ticks)
+        else:
+            # default
+            body["trailTicks"]  = int(trail_ticks)
+            body["offsetTicks"] = int(offset_ticks)
+
+        return self.ctx['api_post'](token, "/api/Order/place", body)
 
 
 def run_strategy_server():
@@ -733,6 +877,8 @@ def run_strategy_server():
         'REQUIRE_PRICE_ABOVE_EMAS': bool(STRAT.get("requirePriceAboveEMAS", False)),
         'CONFIRM_BARS': int(STRAT.get("confirmBars", 0)),
         'STRICT_CROSS_ONLY': bool(STRAT.get("strictCrossOnly", False)),
+        # Force cross-up (LONG) entries for testing without waiting for a natural crossover
+        'FORCE_CROSS_UP': bool(STRAT.get("forceCrossUp", False)),
         'INTRABAR_CROSS': bool(STRAT.get("intrabarCross", False)),
         'TRADE_COOLDOWN_SEC': TRADE_COOLDOWN_SEC,
         # Pine: use synthetic trailing activation to convert fixed SL into a native trailing (type 5)

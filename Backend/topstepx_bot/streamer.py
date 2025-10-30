@@ -798,13 +798,39 @@ class MarketStreamer:
         except Exception:
             pass
 
-        # Place the native trailing stop (type 5)
+        # Place the native trailing stop (type 5) with offset, if available
         sl_order = None
         try:
+            # Compute activation offset in ticks
+            offset_ticks = None
+            try:
+                off_cfg = int(self.ctx.get('TRAIL_OFFSET_TICKS_LONG')) if side == 0 else int(self.ctx.get('TRAIL_OFFSET_TICKS_SHORT'))
+            except Exception:
+                off_cfg = None
+            if off_cfg not in (None, '', False):
+                try:
+                    offset_ticks = max(1, int(off_cfg))
+                except Exception:
+                    offset_ticks = None
+            if offset_ticks is None and (tick_size and tick_size > 0):
+                try:
+                    k = float(self.ctx.get('TRAIL_OFFSET_K_LONG')) if side == 0 else float(self.ctx.get('TRAIL_OFFSET_K_SHORT'))
+                except Exception:
+                    k = 0.0
+                try:
+                    # Derive offset from ATR*K in points, convert to ticks
+                    off_pts = float(abs(k)) * float(atr_val)
+                except Exception:
+                    off_pts = 0.0
+                try:
+                    offset_ticks = int(max(1, round(abs(off_pts) / float(tick_size))))
+                except Exception:
+                    offset_ticks = None
             sl_order = self._place_trailing_order(token, entry_id, side, size, int(trail_ticks_cfg),
                                                  entry_price=float(op),
                                                  tick_size=tick_size if tick_size else None,
-                                                 decimals=decimals if decimals is not None else None)
+                                                 decimals=decimals if decimals is not None else None,
+                                                 offset_ticks=offset_ticks)
         except Exception as exc:
             logging.warning("Failed to place native trailing stop for %s: %s", str(entry_id), exc)
             sl_order = None
@@ -815,6 +841,66 @@ class MarketStreamer:
             logging.info("Native trailing stop placed: entry=%s trail_order=%s", str(entry_id), str(sl_id))
         else:
             logging.warning("Native trailing stop placement failed for %s: %s", str(entry_id), sl_order)
+            # Optional fallback: place fixed STOP if not forcing native-only
+            try:
+                force_native_only = bool(self.ctx.get('FORCE_NATIVE_TRAIL', False))
+            except Exception:
+                force_native_only = False
+            if (not sl_id) and (not force_native_only):
+                try:
+                    if side == 0:
+                        sl_px = float(op) - float(stop_points)
+                    else:
+                        sl_px = float(op) + float(stop_points)
+                    sl_px = self.ctx['snap_to_tick'](sl_px, tick_size, decimals)
+                    sl_fallback = self.ctx['api_post'](token, "/api/Order/place", {
+                        "accountId": self.ctx['ACCOUNT_ID'],
+                        "contractId": self.contract_id,
+                        "type": 4,
+                        "side": 1 - side,
+                        "size": size,
+                        "stopPrice": float(sl_px),
+                        "linkedOrderId": entry_id,
+                    })
+                    if sl_fallback and sl_fallback.get("success") and sl_fallback.get("orderId"):
+                        sl_id = sl_fallback.get("orderId")
+                        logging.info("Fallback STOP placed for entry=%s stop=%s", str(entry_id), str(sl_id))
+                    else:
+                        logging.warning("Fallback STOP failed for entry %s: %s", str(entry_id), sl_fallback)
+                except Exception as exc:
+                    logging.warning("Error placing fallback STOP for %s: %s", str(entry_id), exc)
+
+        # Always place TP leg to form OCO when possible
+        tp_id = None
+        try:
+            if side == 0:
+                tp_px = float(op) + float(stop_points) * 3.0
+            else:
+                tp_px = float(op) - float(stop_points) * 2.0
+            tp_px = self.ctx['snap_to_tick'](tp_px, tick_size, decimals)
+            tp_order = self.ctx['api_post'](token, "/api/Order/place", {
+                "accountId": self.ctx['ACCOUNT_ID'],
+                "contractId": self.contract_id,
+                "type": 1,
+                "side": 1 - side,
+                "size": size,
+                "limitPrice": float(tp_px),
+                "linkedOrderId": entry_id,
+            })
+            if tp_order and tp_order.get("success") and tp_order.get("orderId"):
+                tp_id = tp_order.get("orderId")
+                logging.info("TP placed: entry=%s tp_order=%s price=%.4f", str(entry_id), str(tp_id), float(tp_px))
+            else:
+                logging.warning("TP placement failed for %s: %s", str(entry_id), tp_order)
+        except Exception as exc:
+            logging.warning("Error placing TP for %s: %s", str(entry_id), exc)
+
+        # Create OCO mapping if both legs exist
+        if entry_id and (tp_id is not None) and (sl_id is not None):
+            try:
+                self.ctx['oco_orders'][entry_id] = [tp_id, sl_id]
+            except Exception:
+                pass
 
         # Record active position
         cm = self.ctx['contract_map'].get(self.symbol) or {}
@@ -825,24 +911,18 @@ class MarketStreamer:
             "size": size,
             "entry": op,
             "stop_points": float(stop_points),
-            "tp_id": None,
+            "tp_id": tp_id,
             "sl_id": sl_id,
             "native_trail": bool(sl_id),
             "tickSize": float(cm.get("tickSize") or 0.0),
             "decimals": int(cm.get("decimalPlaces") or 2),
         }
 
-        # Ensure there's no OCO tracking when we don't create TP legs
-        if entry_id in self.ctx['oco_orders']:
-            try:
-                del self.ctx['oco_orders'][entry_id]
-            except Exception:
-                pass
-
         self.ctx['active_entries'][entry_id] = entry_info
 
     def _place_trailing_order(self, token: str, linked_id: int, side: int, size: int, t_ticks: int,
-                              entry_price: float = None, tick_size: float = None, decimals: int = None):
+                              entry_price: float = None, tick_size: float = None, decimals: int = None,
+                              offset_ticks: int = None):
         """Try native trailing stop (type 5) with several field variants.
         Returns the response dict on success; otherwise None.
         """
@@ -875,7 +955,7 @@ class MarketStreamer:
                 offset_points = None
                 stop_init = None
             # Build attempt list, honoring a preferred variant if one was recorded
-            preferred = str(self.ctx.get('TRAIL_VARIANT') or '').strip().lower()
+            preferred = str(self.ctx.get('TRAIL_VARIANT') or 'distanceticks').strip().lower()
             # Diagnostic buffer of trail attempts
             trail_log = self.ctx.setdefault('LAST_TRAIL_ATTEMPTS', [])
             attempts = []
@@ -886,20 +966,41 @@ class MarketStreamer:
                 t_signed = int(t_ticks)
             # Prepare attempt builders
             if True:
-                attempts.append(("trailticks", lambda: (dict(base, trailTicks=int(t_signed)), None)))
+                payload = dict(base, trailTicks=int(t_signed))
+                if offset_ticks not in (None, '', False):
+                    payload["offsetTicks"] = int(max(1, int(offset_ticks)))
+                attempts.append(("trailticks", lambda: (payload, None)))
             if stop_init is not None:
                 # Prefer absolute start price. Try distancePrice then trailPrice.
-                attempts.append(("distanceprice", lambda: (dict(base, distancePrice=float(stop_init)), None)))
-                attempts.append(("trailprice", lambda: (dict(base, trailPrice=float(stop_init)), None)))
+                def _with_offset(p):
+                    if offset_ticks not in (None, '', False):
+                        p["offsetTicks"] = int(max(1, int(offset_ticks)))
+                    return p
+                attempts.append(("distanceprice", lambda: (_with_offset(dict(base, distancePrice=float(stop_init))), None)))
+                attempts.append(("trailprice", lambda: (_with_offset(dict(base, trailPrice=float(stop_init))), None)))
             if trail_points is not None:
-                attempts.append(("traildistance", lambda: (dict(base, trailDistance=float(trail_points)), None)))
-                attempts.append(("distance", lambda: (dict(base, distance=float(trail_points)), None)))
-                attempts.append(("distance+traildistance", lambda: (dict(base, distance=float(trail_points), trailDistance=float(trail_points)), None)))
+                def _with_offset_p(p):
+                    if offset_ticks not in (None, '', False):
+                        p["offsetTicks"] = int(max(1, int(offset_ticks)))
+                    return p
+                attempts.append(("traildistance", lambda: (_with_offset_p(dict(base, trailDistance=float(trail_points))), None)))
+                attempts.append(("distance", lambda: (_with_offset_p(dict(base, distance=float(trail_points))), None)))
+                attempts.append(("distance+traildistance", lambda: (_with_offset_p(dict(base, distance=float(trail_points), trailDistance=float(trail_points))), None)))
             else:
-                attempts.append(("traildistance", lambda: (dict(base, trailDistance=int(max(1, int(t_ticks)))), None)))
-                attempts.append(("distance", lambda: (dict(base, distance=int(max(1, int(t_ticks)))), None)))
-                attempts.append(("distance+traildistance", lambda: (dict(base, distance=int(max(1, int(t_ticks))), trailDistance=int(max(1, int(t_ticks)))), None)))
-            attempts.append(("distanceticks", lambda: (dict(base, distanceTicks=int(max(1, int(t_ticks)))), None)))
+                def _with_offset_i(p):
+                    if offset_ticks not in (None, '', False):
+                        p["offsetTicks"] = int(max(1, int(offset_ticks)))
+                    return p
+                attempts.append(("traildistance", lambda: (_with_offset_i(dict(base, trailDistance=int(max(1, int(t_ticks))))), None)))
+                attempts.append(("distance", lambda: (_with_offset_i(dict(base, distance=int(max(1, int(t_ticks))))), None)))
+                attempts.append(("distance+traildistance", lambda: (_with_offset_i(dict(base, distance=int(max(1, int(t_ticks))), trailDistance=int(max(1, int(t_ticks))))), None)))
+            # Prefer tick-based distance with optional offset
+            def _distanceticks_payload():
+                p = dict(base, distanceTicks=int(max(1, int(t_ticks))))
+                if offset_ticks not in (None, '', False):
+                    p["offsetTicks"] = int(max(1, int(offset_ticks)))
+                return p
+            attempts.append(("distanceticks", lambda: (_distanceticks_payload(), None)))
             attempts.append(("trailingdistance", lambda: (dict(base, trailingDistance=int(max(1, int(t_ticks)))), None)))
             # Reorder to prefer the known-good variant
             if preferred:
