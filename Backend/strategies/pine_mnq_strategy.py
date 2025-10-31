@@ -126,6 +126,7 @@ class PineMarketStreamer(MarketStreamer):
         now = time.time()
         if atr_val is None or ef is None or es is None:
             return
+        just_reversed = False
 
         # Global gates
         if self.ctx.get('TRADING_DISABLED'):
@@ -178,34 +179,33 @@ class PineMarketStreamer(MarketStreamer):
         except Exception:
             pos_now = 0
         if cross_up and (pos_now < 0):
-            logging.info("Opposite cross (UP) while short; flattening existing position")
+            logging.info("Opposite cross (UP) while short; flattening existing position before reversing")
             try:
                 self._flatten_and_cancel()
             except Exception:
                 pass
-            # Optional small guard to let venue settle after flatten
+            # Do not return here — proceed to entry decision.
+            # Refresh open orders count after flatten attempt for accurate gating below.
             try:
-                delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
-                if delay > 0:
-                    self._reverse_guard_until = time.time() + delay
+                oc = self.ctx['get_open_orders_count'](self.contract_id)
             except Exception:
                 pass
+            just_reversed = True
             self._last_rel = rel
-            return
         if (not self.ctx['LONG_ONLY']) and cross_dn and (pos_now > 0):
-            logging.info("Opposite cross (DOWN) while long; flattening existing position")
+            logging.info("Opposite cross (DOWN) while long; flattening existing position before reversing")
             try:
                 self._flatten_and_cancel()
             except Exception:
                 pass
+            # Do not return here — proceed to entry decision.
+            # Refresh open orders count after flatten attempt for accurate gating below.
             try:
-                delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
-                if delay > 0:
-                    self._reverse_guard_until = time.time() + delay
+                oc = self.ctx['get_open_orders_count'](self.contract_id)
             except Exception:
                 pass
+            just_reversed = True
             self._last_rel = rel
-            return
         if (now - float(getattr(self, '_last_signal_ts', 0.0))) < float(self.ctx.get('TRADE_COOLDOWN_SEC', 0)):
             self._last_rel = rel
             return
@@ -246,7 +246,7 @@ class PineMarketStreamer(MarketStreamer):
                     delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
                 except Exception:
                     delay = 0.0
-                if delay > 0:
+                if delay > 0 and (not just_reversed):
                     try:
                         self._reverse_guard_until = time.time() + delay
                     except Exception:
@@ -282,7 +282,7 @@ class PineMarketStreamer(MarketStreamer):
                     delay = float(self.ctx.get('REVERSE_ENTRY_DELAY_SEC', 0.0) or 0.0)
                 except Exception:
                     delay = 0.0
-                if delay > 0:
+                if delay > 0 and (not just_reversed):
                     try:
                         self._reverse_guard_until = time.time() + delay
                     except Exception:
